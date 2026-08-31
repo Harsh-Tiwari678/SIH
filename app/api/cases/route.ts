@@ -3,6 +3,36 @@ import { createClient } from "@/lib/supabase/server";
 
 export const runtime = "nodejs";
 
+export async function GET() {
+  const supabase = await createClient();
+
+  // 1. authenticate — resolve the session from the request cookies.
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // 2. list — query the cases table through the authenticated session so the
+  //    existing `cases_select_creator_or_member` RLS policy filters to only the
+  //    cases this user is allowed to see. No service-role key is used; access
+  //    is enforced by the database, not the application.
+  const { data: cases, error } = await supabase
+    .from("cases")
+    .select("id, case_number, title, description, status, created_at, updated_at")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return NextResponse.json(
+      { error: "Failed to load cases" },
+      { status: 500 },
+    );
+  }
+
+  return NextResponse.json({ cases }, { status: 200 });
+}
+
 export async function POST(request: Request) {
   const supabase = await createClient();
 
