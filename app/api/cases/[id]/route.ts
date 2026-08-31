@@ -24,10 +24,15 @@ export async function GET(
   //    cases this user may see. When RLS hides the row, `.maybeSingle()`
   //    yields no data, which we deliberately report as 404 — the same response
   //    as a case that does not exist, so we never reveal whether an
-  //    inaccessible case exists. No service-role key is used.
+  //    inaccessible case exists. The embedded `case_members` relation is
+  //    likewise constrained by RLS (`case_members_select_member_or_self`), and
+  //    since reaching this case already required membership, the returned
+  //    roster is the case's own members. No service-role key is used.
   const { data: caseRow, error } = await supabase
     .from("cases")
-    .select("id, case_number, title, description, status, created_at, updated_at")
+    .select(
+      "id, case_number, title, description, status, created_at, updated_at, case_members(profile_id, role_in_case, added_at)",
+    )
     .eq("id", id)
     .maybeSingle();
 
