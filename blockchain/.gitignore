@@ -1,0 +1,20 @@
+# dependencies
+/node_modules
+
+# hardhat generated
+/artifacts
+/cache
+/types
+/typechain-types
+
+# coverage
+/coverage
+/coverage.json
+
+# env (never commit keys)
+.env
+.env.*
+!.env.example
+
+# misc
+.DS_Store
