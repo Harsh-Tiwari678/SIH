@@ -8,11 +8,16 @@
 // ---------------------------------------------------------------------------
 
 // Structurally compatible with lib/blockchain/anchor.ts's OnChainAnchor (the
-// subset decideVerification consults). Declared locally so this module stays
-// free of any dependency on the server-only anchor service.
+// subset the reconcile/classification helpers consult). Declared locally so
+// this module stays free of any dependency on the server-only anchor service.
+// blockNumber/anchoredAt come from the read-only getAnchor() result and are
+// what a reconciliation writes to the DB — the chain stores NO transaction
+// hash, so tx_hash can never be recovered here.
 export interface OnChainAnchorResult {
   exists: boolean;
   storedSha256: string;
+  anchoredAt: bigint;
+  blockNumber: bigint;
   verified: boolean;
 }
 
@@ -167,24 +172,118 @@ export function parseCreateAnchorResult(
 }
 
 /**
- * Decide, from a read-only getOnChainAnchor() result, whether the stored
- * on-chain anchor matches what we expect. Returns "mismatch" only on a
- * DEFINITIVE on-chain inconsistency (missing entry, hash mismatch, or
- * verify() false). A thrown read error is handled by the caller as ambiguous,
- * never as a mismatch.
+ * Classify a DEFINITIVE read-only on-chain state against the expected evidence
+ * SHA-256 (bytes32 hex, e.g. '0x…'). This is the single gate that decides what
+ * a retry may do, so NO action — especially no broadcast — happens without it:
+ *
+ *   "absent"      — the (evidence_id_hash, version_id_hash) slot is empty; a
+ *                   normal anchor broadcast is the only thing that may send a
+ *                   transaction.
+ *   "matched"     — the slot holds EXACTLY our expected evidence hash and
+ *                   verify() returned true; the pending DB row can converge to
+ *                   anchored WITHOUT broadcasting.
+ *   "mismatched"  — the slot is occupied by a DIFFERENT evidence hash (or the
+ *                   on-chain verify() disagrees); an integrity anomaly. Never
+ *                   mark anchored, never claim the slot as ours — fail for
+ *                   review instead.
+ *
+ * Only a definitive result is classified here; a failed chain READ is handled
+ * by the caller as ambiguous (row stays pending), never as a mismatch.
  */
-export function decideVerification(
+export function classifyOnChainState(
   onChain: OnChainAnchorResult,
   expectedEvidenceSha256: string,
-): "ok" | "mismatch" {
-  if (!onChain.exists) return "mismatch";
+): "absent" | "matched" | "mismatched" {
+  if (!onChain.exists) return "absent";
   if (
-    onChain.storedSha256.toLowerCase() !== expectedEvidenceSha256.toLowerCase()
+    onChain.storedSha256.toLowerCase() !==
+      expectedEvidenceSha256.toLowerCase() ||
+    !onChain.verified
   ) {
-    return "mismatch";
+    return "mismatched";
   }
-  if (!onChain.verified) return "mismatch";
-  return "ok";
+  return "matched";
+}
+
+/**
+ * Build the exact parameters for the reconcile_anchor_anchored RPC from an
+ * on-chain observation. Deliberately carries NO transaction hash — the chain
+ * read cannot recover one, and fabricating a hash is forbidden. Rejects
+ * unusable block metadata (a real mined anchor always has block_number >= 1 and
+ * anchored_at > 0); the caller maps that definitive anomaly to a fail-for-review
+ * outcome rather than recording garbage.
+ */
+export interface ReconcileAnchorParams {
+  p_anchor_id: string;
+  p_block_number: bigint;
+  p_anchored_at: string;
+}
+
+export function buildReconcileParams(
+  anchorId: string,
+  onChain: OnChainAnchorResult,
+): ReconcileAnchorParams {
+  if (onChain.blockNumber < 1n || onChain.anchoredAt <= 0n) {
+    throw new AnchorOrchestrationError(
+      "invalid_rpc_result",
+      "Can't reconcile: the on-chain anchor is missing valid block metadata",
+    );
+  }
+  return {
+    p_anchor_id: anchorId,
+    p_block_number: onChain.blockNumber,
+    p_anchored_at: blockTimestampToIso(onChain.anchoredAt),
+  };
+}
+
+/**
+ * The single decision point of an anchor attempt, decided BEFORE any
+ * transaction is sent:
+ *
+ *   "already_anchored"        — the authoritative DB slot is already anchored
+ *                               (terminal); nothing to do.
+ *   "reconcile"               — the chain holds OUR evidence hash; converge the
+ *                               pending row to anchored, no broadcast.
+ *   "broadcast"               — the slot is provably absent; the ONLY phase that
+ *                               may send an Ethereum transaction.
+ *   "mark_failed_verification"— the slot holds a DIFFERENT hash (integrity
+ *                               anomaly); mark failed for review, never anchored.
+ *   "verification_ambiguous"  — the chain could not be read (caller passes
+ *                               null); keep the row pending, do nothing at all.
+ */
+export type AnchorPlan =
+  | { phase: "already_anchored" }
+  | { phase: "reconcile" }
+  | { phase: "broadcast" }
+  | { phase: "mark_failed_verification"; message: string }
+  | { phase: "verification_ambiguous"; message: string };
+
+export function planAnchorAttempt(
+  created: CreateAnchorOutcome,
+  onChain: OnChainAnchorResult | null,
+  expectedEvidenceSha256: string,
+): AnchorPlan {
+  if (created.kind === "already_anchored") {
+    return { phase: "already_anchored" };
+  }
+  if (onChain === null) {
+    return {
+      phase: "verification_ambiguous",
+      message: "Could not read the on-chain anchor store, so no action was taken",
+    };
+  }
+  switch (classifyOnChainState(onChain, expectedEvidenceSha256)) {
+    case "absent":
+      return { phase: "broadcast" };
+    case "matched":
+      return { phase: "reconcile" };
+    case "mismatched":
+      return {
+        phase: "mark_failed_verification",
+        message:
+          "On-chain verification failed: the anchor slot holds a different evidence hash",
+      };
+  }
 }
 
 /** Read the `transitioned` boolean from a mark_*_rpc jsonb result. */

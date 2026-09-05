@@ -8,10 +8,13 @@ import assert from "node:assert/strict";
 import {
   AnchorOrchestrationError,
   blockTimestampToIso,
-  decideVerification,
+  buildReconcileParams,
+  classifyOnChainState,
   isValidDocumentVersionId,
   parseCreateAnchorResult,
+  planAnchorAttempt,
   readTransitioned,
+  type CreateAnchorOutcome,
 } from "./orchestrator-core.ts";
 
 // Test fixtures (NOT the live, already-anchored pair).
@@ -149,7 +152,7 @@ test("parseCreateAnchorResult accepts the authoritative v_anchor even when the i
   assert.equal(result.kind, "pending");
 });
 
-// ---- decideVerification ----------------------------------------------------
+// ---- classifyOnChainState --------------------------------------------------
 
 const okOnChain = {
   exists: true,
@@ -159,35 +162,165 @@ const okOnChain = {
   verified: true,
 };
 
-test("decideVerification returns ok when the stored anchor matches and verify() is true", () => {
-  assert.equal(decideVerification(okOnChain, SHA256_BYTES32), "ok");
-});
+const OTHER_HASH =
+  "0x1111111111111111111111111111111111111111111111111111111111111111";
 
-test("decideVerification returns mismatch when the on-chain entry does not exist", () => {
+test("classifyOnChainState returns absent when the slot is empty", () => {
   assert.equal(
-    decideVerification({ ...okOnChain, exists: false }, SHA256_BYTES32),
-    "mismatch",
+    classifyOnChainState({ ...okOnChain, exists: false }, SHA256_BYTES32),
+    "absent",
   );
 });
 
-test("decideVerification returns mismatch when the stored hash differs", () => {
-  const otherHash =
-    "0x1111111111111111111111111111111111111111111111111111111111111111";
-  assert.equal(decideVerification({ ...okOnChain, storedSha256: otherHash }, SHA256_BYTES32), "mismatch");
+test("classifyOnChainState returns matched when the slot holds our exact hash and verify() is true", () => {
+  assert.equal(classifyOnChainState(okOnChain, SHA256_BYTES32), "matched");
 });
 
-test("decideVerification returns mismatch when verify() is false", () => {
+test("classifyOnChainState returns mismatched when the stored hash differs", () => {
   assert.equal(
-    decideVerification({ ...okOnChain, verified: false }, SHA256_BYTES32),
-    "mismatch",
+    classifyOnChainState({ ...okOnChain, storedSha256: OTHER_HASH }, SHA256_BYTES32),
+    "mismatched",
   );
 });
 
-test("decideVerification compares the hash case-insensitively", () => {
+test("classifyOnChainState returns mismatched when verify() disagrees", () => {
   assert.equal(
-    decideVerification({ ...okOnChain, storedSha256: SHA256_BYTES32.toUpperCase() }, SHA256_BYTES32),
-    "ok",
+    classifyOnChainState({ ...okOnChain, verified: false }, SHA256_BYTES32),
+    "mismatched",
   );
+});
+
+test("classifyOnChainState compares the hash case-insensitively", () => {
+  assert.equal(
+    classifyOnChainState(
+      { ...okOnChain, storedSha256: SHA256_BYTES32.toUpperCase() },
+      SHA256_BYTES32,
+    ),
+    "matched",
+  );
+});
+
+// ---- buildReconcileParams --------------------------------------------------
+
+test("buildReconcileParams uses only the on-chain block metadata (req 10: no tx hash)", () => {
+  const params = buildReconcileParams(ANCHOR_ID, okOnChain);
+  assert.deepEqual(params, {
+    p_anchor_id: ANCHOR_ID,
+    p_block_number: 19_000_000n,
+    p_anchored_at: "2023-11-14T22:13:20.000Z",
+  });
+  assert.equal("p_tx_hash" in params, false);
+});
+
+test("buildReconcileParams rejects an on-chain record without a block number", () => {
+  assert.throws(
+    () => buildReconcileParams(ANCHOR_ID, { ...okOnChain, blockNumber: 0n }),
+    AnchorOrchestrationError,
+  );
+});
+
+test("buildReconcileParams rejects an on-chain record without an anchor timestamp", () => {
+  assert.throws(
+    () => buildReconcileParams(ANCHOR_ID, { ...okOnChain, anchoredAt: 0n }),
+    AnchorOrchestrationError,
+  );
+});
+
+// ---- planAnchorAttempt (the reconcile-first decision gate) -----------------
+
+function pendingCreated(overrides: { reused?: boolean } = {}): CreateAnchorOutcome {
+  return {
+    kind: "pending",
+    anchorId: ANCHOR_ID,
+    reused: overrides.reused ?? false,
+    evidenceId: EVIDENCE_UUID,
+    documentVersionId: VERSION_UUID,
+    evidenceSha256: SHA256_HEX,
+  };
+}
+
+test("[1] pending + matched on-chain -> reconcile, never broadcast", () => {
+  assert.deepEqual(planAnchorAttempt(pendingCreated(), okOnChain, SHA256_BYTES32), {
+    phase: "reconcile",
+  });
+});
+
+test("[2] pending + absent on-chain -> broadcast (normal anchor proceeds)", () => {
+  assert.deepEqual(
+    planAnchorAttempt(
+      pendingCreated(),
+      { ...okOnChain, exists: false },
+      SHA256_BYTES32,
+    ),
+    { phase: "broadcast" },
+  );
+});
+
+test("[3] pending + mismatched slot -> mark failed for review, never anchored", () => {
+  const plan = planAnchorAttempt(
+    pendingCreated(),
+    { ...okOnChain, storedSha256: OTHER_HASH },
+    SHA256_BYTES32,
+  );
+  assert.equal(plan.phase, "mark_failed_verification");
+  assert.match(plan.message, /different evidence hash/);
+});
+
+test("[4] pending + chain READ failure (null) -> verification_ambiguous, do nothing", () => {
+  const plan = planAnchorAttempt(pendingCreated(), null, SHA256_BYTES32);
+  assert.equal(plan.phase, "verification_ambiguous");
+  assert.notEqual(plan.phase, "broadcast");
+  assert.notEqual(plan.phase, "mark_failed_verification");
+});
+
+test("[5] a db_sync-failed retry recovers via reconciliation with no second broadcast", () => {
+  // After db_sync_failed the row STAYS pending; the retry's chain read is
+  // matched, so it plans reconcile and builds only the block-metadata RPC
+  // params — the exact primitive that converges the row without another tx.
+  assert.equal(planAnchorAttempt(pendingCreated(), okOnChain, SHA256_BYTES32).phase, "reconcile");
+  const params = buildReconcileParams(ANCHOR_ID, okOnChain);
+  assert.equal("p_tx_hash" in params, false);
+});
+
+test("[6] a retry after a reconcile does NOT broadcast (row is now anchored)", () => {
+  // create_blockchain_anchor returns already_anchored for the now-terminal row.
+  assert.deepEqual(
+    planAnchorAttempt({ kind: "already_anchored" }, okOnChain, SHA256_BYTES32),
+    { phase: "already_anchored" },
+  );
+});
+
+test("[7] reconcile params carry no caller identity (authorization is session-derived)", () => {
+  const params = buildReconcileParams(ANCHOR_ID, okOnChain);
+  assert.deepEqual(Object.keys(params).sort(), [
+    "p_anchor_id",
+    "p_anchored_at",
+    "p_block_number",
+  ]);
+});
+
+test("[8] an already-anchored DB row stays terminal regardless of chain state", () => {
+  for (const onChain of [
+    okOnChain,
+    { ...okOnChain, exists: false },
+    { ...okOnChain, storedSha256: OTHER_HASH },
+  ]) {
+    assert.equal(
+      planAnchorAttempt({ kind: "already_anchored" }, onChain, SHA256_BYTES32).phase,
+      "already_anchored",
+    );
+  }
+});
+
+test("[9] a failed row's retry (reused pending slot) proceeds safely by chain state", () => {
+  // create_blockchain_anchor resets a failed row to pending (reused=true); the
+  // plan then routes exactly like any other pending row.
+  const reused = pendingCreated({ reused: true });
+  assert.equal(
+    planAnchorAttempt(reused, { ...okOnChain, exists: false }, SHA256_BYTES32).phase,
+    "broadcast",
+  );
+  assert.equal(planAnchorAttempt(reused, okOnChain, SHA256_BYTES32).phase, "reconcile");
 });
 
 // ---- readTransitioned ------------------------------------------------------

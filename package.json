@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test lib/blockchain/*.test.ts"
+    "test": "node --experimental-strip-types --experimental-test-module-mocks --experimental-loader ./lib/blockchain/test-support/test-loader.mjs --test lib/blockchain/*.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.5",

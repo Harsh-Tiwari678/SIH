@@ -176,6 +176,15 @@ export function anchorOutcomeBody(outcome: AnchorOutcome): Record<string, unknow
         block_number: outcome.blockNumber,
         anchored_at: outcome.anchoredAt,
       };
+    case "reconciled":
+      // Recovered without a new transaction; NO tx hash is fabricated — the
+      // on-chain read cannot recover one, so the field is intentionally absent.
+      return {
+        status: "reconciled",
+        anchor_id: outcome.anchorId,
+        block_number: outcome.blockNumber,
+        anchored_at: outcome.anchoredAt,
+      };
     case "already_anchored":
       return { status: "already_anchored" };
     case "verification_ambiguous":
@@ -209,6 +218,7 @@ export function anchorOutcomeBody(outcome: AnchorOutcome): Record<string, unknow
 export function anchorOutcomeHttpStatus(outcome: AnchorOutcome): number {
   switch (outcome.status) {
     case "anchored":
+    case "reconciled":
     case "already_anchored":
       return 200;
     case "verification_ambiguous":

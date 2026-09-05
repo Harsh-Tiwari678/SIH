@@ -182,6 +182,23 @@ test("anchorOutcomeBody exposes the full anchored state", () => {
   });
 });
 
+test("[10] reconciling exposes the recovered block metadata but NEVER a tx hash", () => {
+  assert.deepEqual(
+    anchorOutcomeBody({
+      status: "reconciled",
+      anchorId: ANCHOR_ID,
+      blockNumber: 19_000_000,
+      anchoredAt: "2023-11-14T22:13:20.000Z",
+    }),
+    {
+      status: "reconciled",
+      anchor_id: ANCHOR_ID,
+      block_number: 19_000_000,
+      anchored_at: "2023-11-14T22:13:20.000Z",
+    },
+  );
+});
+
 test("anchorOutcomeBody maps already_anchored", () => {
   assert.deepEqual(anchorOutcomeBody({ status: "already_anchored" }), {
     status: "already_anchored",
@@ -242,6 +259,7 @@ test("anchorOutcomeBody maps db_sync_failed", () => {
 
 test("anchorOutcomeHttpStatus returns 200 for anchored outcomes", () => {
   assert.equal(anchorOutcomeHttpStatus({ status: "anchored", anchorId: ANCHOR_ID, txHash: "0x" + "a".repeat(64), blockNumber: 1, anchoredAt: "x" }), 200);
+  assert.equal(anchorOutcomeHttpStatus({ status: "reconciled", anchorId: ANCHOR_ID, blockNumber: 1, anchoredAt: "x" }), 200);
   assert.equal(anchorOutcomeHttpStatus({ status: "already_anchored" }), 200);
 });
 
@@ -267,6 +285,17 @@ test("anchorErrorStatus maps orchestration error kinds to HTTP statuses", () => 
   assert.equal(anchorErrorStatus({ kind: "rpc_error", message: "m" }).status, 500);
   assert.equal(anchorErrorStatus({ kind: "invalid_rpc_result", message: "m" }).status, 500);
   assert.equal(anchorErrorStatus({ kind: "database_error", message: "m" }).status, 500);
+});
+
+test("[7] authorization failures surface as 4xx, never as an anchor success", () => {
+  // Requirement 7: authorization is server-side. A session-less or non-leading
+  // actor must never see a 200 anchor outcome — only a 401/403 error.
+  assert.notEqual(anchorErrorStatus({ kind: "not_authenticated", message: "m" }).status, 200);
+  assert.notEqual(anchorErrorStatus({ kind: "not_authorized_to_anchor", message: "m" }).status, 200);
+  assert.equal(
+    anchorErrorStatus({ kind: "not_authenticated", message: "m" }).error,
+    "m",
+  );
 });
 
 test("anchorErrorStatus keeps the safe orchestration message", () => {

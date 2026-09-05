@@ -27,6 +27,7 @@ import {
   getOnChainAnchor,
   type AnchorConfirmation,
   type AnchorRequest,
+  type OnChainAnchor,
 } from "./anchor";
 import {
   BlockchainAnchorError,
@@ -40,23 +41,28 @@ import { sha256ToBytes32 } from "./encoding";
 import {
   AnchorOrchestrationError,
   blockTimestampToIso,
-  decideVerification,
+  buildReconcileParams,
   isValidDocumentVersionId,
   parseCreateAnchorResult,
+  planAnchorAttempt,
   readTransitioned,
+  type AnchorPlan,
   type CreateAnchorOutcome,
+  type ReconcileAnchorParams,
 } from "./orchestrator-core";
 
 export type {
   AnchorOrchestrationErrorKind,
+  AnchorPlan,
   CreateAnchorOutcome,
 } from "./orchestrator-core";
 export {
   AnchorOrchestrationError,
   blockTimestampToIso,
-  decideVerification,
+  buildReconcileParams,
   isValidDocumentVersionId,
   parseCreateAnchorResult,
+  planAnchorAttempt,
   readTransitioned,
 } from "./orchestrator-core";
 
@@ -69,9 +75,12 @@ export {
 // AnchorOrchestrationError. The db_sync_failed / verification_ambiguous
 // outcomes represent the intentional distributed-sync window: the transaction
 // is confirmed on-chain but the DB could not be written, so it stays pending
-// for later reconciliation via getOnChainAnchor().
+// for later reconciliation. "reconciled" is the recovered terminal state: the
+// row converged from pending -> anchored WITHOUT a new transaction and WITHOUT
+// a tx hash (the chain read cannot recover one; none is fabricated).
 export type AnchorOutcome =
   | { status: "anchored"; anchorId: string; txHash: string; blockNumber: number; anchoredAt: string }
+  | { status: "reconciled"; anchorId: string; blockNumber: number; anchoredAt: string }
   | { status: "already_anchored"; anchorId?: string }
   | { status: "failed"; anchorId: string; category: AnchorErrorCategory; message: string }
   | { status: "verification_failed"; anchorId: string; message: string }
@@ -119,6 +128,9 @@ function markRpcError(operation: string, message: string): AnchorOrchestrationEr
     return new AnchorOrchestrationError("not_authorized_to_anchor", "Only the case lead or an investigator can anchor evidence");
   }
   if (operation === "mark_anchor_anchored" && message.includes("hash_mismatch")) {
+    return new AnchorOrchestrationError("invalid_rpc_result", "Stored hash does not match the document version hash");
+  }
+  if (operation === "reconcile_anchor_anchored" && message.includes("hash_mismatch")) {
     return new AnchorOrchestrationError("invalid_rpc_result", "Stored hash does not match the document version hash");
   }
   return new AnchorOrchestrationError("database_error", `${operation} failed`);
@@ -209,12 +221,83 @@ export async function anchorDocumentVersion(
   // complete blockchain_anchors row.
   const anchorId = created.anchorId;
 
-  // Step 2 — anchor on-chain (server-only blockchain service).
+  // Step 2 — RECONCILE-FIRST: read the chain BEFORE deciding whether to send a
+  // transaction. This is the single gate that prevents a second broadcast
+  // merely because the DB row is pending: only an on-chain "absent" result
+  // permits broadcasting; a "matched" result converges the row via the
+  // reconcile RPC (no new tx, no fabricated tx hash); a read failure keeps the
+  // row pending and never marks it failed.
+  const expectedSha256 = sha256ToBytes32(created.evidenceSha256);
+  let onChain: OnChainAnchor;
+  try {
+    onChain = await getOnChainAnchor(request);
+  } catch (raw) {
+    if (raw instanceof BlockchainAnchorError) {
+      logSafe("warn", "verification_ambiguous", { documentVersionId, anchorId });
+      return ambiguousOutcome(anchorId, raw.category);
+    }
+    // Any other error is unexpected; do not mis-classify it as a definitive
+    // on-chain mismatch or a failed broadcast.
+    throw raw;
+  }
+
+  const plan = planAnchorAttempt(created, onChain, expectedSha256);
+
+  switch (plan.phase) {
+    case "already_anchored":
+      // The DB slot is terminal (this path is normally short-circuited by the
+      // create RPC, which raises already_anchored); nothing to do.
+      logSafe("info", "already_anchored", { documentVersionId, anchorId });
+      return { status: "already_anchored", anchorId };
+    case "verification_ambiguous":
+      return { status: "verification_ambiguous", anchorId, message: plan.message };
+    case "mark_failed_verification":
+      return resolveFromOnChain(supabase, anchorId, plan, onChain);
+    case "reconcile":
+      return resolveFromOnChain(supabase, anchorId, plan, onChain);
+    case "broadcast":
+      break; // the ONLY phase that may transmit — proceed below
+  }
+
+  // Step 3 — broadcast (slot proven absent on-chain).
   let confirmation: AnchorConfirmation;
   try {
     confirmation = await anchorEvidence(request);
   } catch (raw) {
     if (raw instanceof BlockchainAnchorError) {
+      if (raw.category === "already_anchored") {
+        // Second line of defense: a slot appeared between our read and the
+        // broadcast. Never mark the row failed and NEVER retry the broadcast —
+        // re-read the chain and reconcile if (and only if) it is OUR hash; a
+        // different hash is an anomaly to fail for review.
+        logSafe("warn", "broadcast_conflict_already_anchored", {
+          documentVersionId,
+          anchorId,
+        });
+        let reOnChain: OnChainAnchor;
+        try {
+          reOnChain = await getOnChainAnchor(request);
+        } catch (reRaw) {
+          if (reRaw instanceof BlockchainAnchorError) {
+            return ambiguousOutcome(anchorId, reRaw.category);
+          }
+          throw reRaw;
+        }
+        const rePlan = planAnchorAttempt(created, reOnChain, expectedSha256);
+        if (rePlan.phase === "reconcile") {
+          return resolveFromOnChain(supabase, anchorId, rePlan, reOnChain);
+        }
+        if (rePlan.phase === "mark_failed_verification") {
+          return resolveFromOnChain(supabase, anchorId, rePlan, reOnChain);
+        }
+        // "absent" or ambiguous again: the provider gave contradictory data.
+        return {
+          status: "verification_ambiguous",
+          anchorId,
+          message: "Could not reconcile the on-chain anchor after a conflicting broadcast",
+        };
+      }
+      // Genuine broadcast failure: definitive on-chain error, safe category.
       const category = raw.category;
       const message = safeChainErrorFrom(category);
       await markFailedBestEffort(supabase, anchorId, message);
@@ -224,38 +307,9 @@ export async function anchorDocumentVersion(
     throw raw;
   }
 
-  // Step 3 — read-only verification against the deployed contract. The tx is
-  // already confirmed on-chain; verification only produces a definitive
-  // mismatch (each a harmless DB-side state). An ambiguous read error never
-  // marks the row failed.
-  let verificationPasses = false;
-  try {
-    const onChain = await getOnChainAnchor(request);
-    verificationPasses =
-      decideVerification(onChain, sha256ToBytes32(created.evidenceSha256)) === "ok";
-  } catch (raw) {
-    if (raw instanceof BlockchainAnchorError) {
-      const message = safeChainErrorFrom(raw.category);
-      // Intentional distributed-sync window: the tx succeeded but we cannot
-      // confirm the stored state. Leave the DB pending for reconciliation —
-      // do NOT mark failed, do NOT send another tx.
-      logSafe("warn", "verification_ambiguous", { documentVersionId, anchorId });
-      return { status: "verification_ambiguous", anchorId, message };
-    }
-    // Any other error is unexpected; do not mis-classify it as a definitive
-    // on-chain mismatch by letting it fall through to markFailedBestEffort.
-    throw raw;
-  }
-
-  if (!verificationPasses) {
-    const message = "On-chain verification failed: stored anchor does not match the expected evidence hash";
-    await markFailedBestEffort(supabase, anchorId, message);
-    logSafe("error", "verification_failed", { documentVersionId, anchorId });
-    return { status: "verification_failed", anchorId, message };
-  }
-
-  // Step 4 — record the confirmed anchor in the DB.
-  let markedAnchored: boolean;
+  // Step 4 — record the confirmed anchor in the DB from the AUTHORITATIVE
+  // receipt. The pre-broadcast read already proved the slot absent, so the
+  // confirmed receipt is sufficient; no post-broadcast re-read is needed.
   try {
     const { data: markData, error: markError } = await supabase.rpc(
       "mark_anchor_anchored",
@@ -269,12 +323,21 @@ export async function anchorDocumentVersion(
     if (markError) {
       throw markRpcError("mark_anchor_anchored", markError.message);
     }
-    markedAnchored = readTransitioned(markData);
+    const markedAnchored = readTransitioned(markData);
+    if (!markedAnchored) {
+      // The row was not pending at update time (concurrent terminal transition).
+      // The on-chain anchor exists, so this is not a failure.
+      logSafe("warn", "anchor_already_terminal", { documentVersionId, anchorId });
+      return { status: "already_anchored", anchorId };
+    }
   } catch (raw) {
-    if (raw instanceof AnchorOrchestrationError) {
-      // Intentional distributed-sync window: the tx is confirmed on-chain but
-      // the DB could not be updated. Leave the DB pending for reconciliation —
-      // do NOT mark failed, do NOT send another transaction.
+    // Intentional distributed-sync window: the tx is confirmed on-chain but the
+    // DB could not be updated. ONLY a genuine database error is treated as that
+    // window — leave the DB pending for reconciliation, do NOT mark failed and
+    // do NOT send another transaction. Any other failure (authentication,
+    // authorization, or a DB invariant anomaly) is re-thrown so it surfaces as
+    // its true status instead of being masked as a 202 sync issue.
+    if (raw instanceof AnchorOrchestrationError && raw.kind === "database_error") {
       logSafe("error", "db_sync_failed", { documentVersionId, anchorId, txHash: confirmation.txHash });
       return {
         status: "db_sync_failed",
@@ -283,16 +346,6 @@ export async function anchorDocumentVersion(
       };
     }
     throw raw;
-  }
-
-  if (!markedAnchored) {
-    // The row was not pending at update time (concurrent terminal transition).
-    // The on-chain anchor exists, so this is not a failure.
-    logSafe("warn", "anchor_already_terminal", { documentVersionId, anchorId });
-    return {
-      status: "already_anchored",
-      anchorId,
-    };
   }
 
   logSafe("info", "anchored", {
@@ -312,6 +365,105 @@ export async function anchorDocumentVersion(
 // ---------------------------------------------------------------------------
 // Private helpers (server-side)
 // ---------------------------------------------------------------------------
+
+function ambiguousOutcome(
+  anchorId: string,
+  category: AnchorErrorCategory,
+): AnchorOutcome {
+  return {
+    status: "verification_ambiguous",
+    anchorId,
+    message: safeChainErrorFrom(category),
+  };
+}
+
+/**
+ * Act on a reconcile / mark_failed_verification plan (i.e. after a DEFINITIVE
+ * chain read, when the row must converge WITHOUT a broadcast). Every other
+ * phase (broadcast / already_anchored / verification_ambiguous) is owned by
+ * the caller.
+ */
+async function resolveFromOnChain(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  anchorId: string,
+  plan: AnchorPlan,
+  onChain: OnChainAnchor,
+): Promise<AnchorOutcome> {
+  if (plan.phase === "mark_failed_verification") {
+    await markFailedBestEffort(supabase, anchorId, plan.message);
+    logSafe("error", "verification_failed", { anchorId });
+    return { status: "verification_failed", anchorId, message: plan.message };
+  }
+  return reconcileOutcome(supabase, anchorId, onChain);
+}
+
+/**
+ * Converge a pending row to anchored from on-chain truth, WITHOUT broadcasting
+ * and WITHOUT a transaction hash. `onChain` is the read-only contract result
+ * that already proved the slot holds our exact evidence hash; its block_number
+ * and anchored_at (not a client-supplied value) become the row's metadata. The
+ * RPC re-checks auth/authorization and only transitions pending -> anchored.
+ */
+async function reconcileOutcome(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  anchorId: string,
+  onChain: OnChainAnchor,
+): Promise<AnchorOutcome> {
+  let params: ReconcileAnchorParams;
+  try {
+    params = buildReconcileParams(anchorId, onChain);
+  } catch (raw) {
+    if (raw instanceof AnchorOrchestrationError && raw.kind === "invalid_rpc_result") {
+      // The slot exists but its block metadata is unusable — a definitive
+      // anomaly. Never record garbage and never fabricate data; fail for review.
+      const message = "On-chain verification failed: the anchor record is missing valid block metadata";
+      await markFailedBestEffort(supabase, anchorId, message);
+      logSafe("error", "verification_failed", { anchorId });
+      return { status: "verification_failed", anchorId, message };
+    }
+    throw raw;
+  }
+
+  try {
+    const { data, error } = await supabase.rpc("reconcile_anchor_anchored", {
+      p_anchor_id: params.p_anchor_id,
+      p_block_number: Number(params.p_block_number),
+      p_anchored_at: params.p_anchored_at,
+    });
+    if (error) {
+      throw markRpcError("reconcile_anchor_anchored", error.message);
+    }
+    if (!readTransitioned(data)) {
+      // The row was not pending at update time (concurrent terminal transition).
+      // The chain still holds our anchor, so this is not a failure.
+      logSafe("warn", "anchor_already_terminal", { anchorId });
+      return { status: "already_anchored", anchorId };
+    }
+  } catch (raw) {
+    // Same distributed-sync window as mark_anchor_anchored: the chain is
+    // correct but the DB could not converge. ONLY a genuine database error is
+    // swallowed here — the row stays pending for a later reconciliation retry
+    // (no mark failed, no new broadcast). Any other failure (authentication,
+    // authorization, or a DB invariant anomaly) surfaces as its true status.
+    if (raw instanceof AnchorOrchestrationError && raw.kind === "database_error") {
+      logSafe("error", "db_sync_failed_reconcile", { anchorId });
+      return {
+        status: "db_sync_failed",
+        anchorId,
+        message: "The anchor was found on-chain, but the database could not be updated and will be reconciled later",
+      };
+    }
+    throw raw;
+  }
+
+  logSafe("info", "reconciled", { anchorId });
+  return {
+    status: "reconciled",
+    anchorId,
+    blockNumber: Number(params.p_block_number),
+    anchoredAt: params.p_anchored_at,
+  };
+}
 
 /**
  * Record a definitive on-chain failure. Only called with a BOUNDED safe
