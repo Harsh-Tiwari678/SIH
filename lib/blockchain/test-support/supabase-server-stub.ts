@@ -16,14 +16,38 @@ export type RpcHandler = (
   params: Record<string, unknown>,
 ) => RpcResult | Promise<RpcResult>;
 
+export interface TableQuery {
+  table: string;
+  select: string;
+  eqColumn: string;
+  eqValue: unknown;
+}
+
+export type TableHandler = (
+  query: TableQuery,
+) => RpcResult | Promise<RpcResult>;
+
+// Minimal scripted .from(table).select(...).eq(...).maybeSingle() builder used
+// by the verification tests. The read-only verification service pulls the
+// document version / evidence / anchor rows through these reads; RLS filters
+// are simulated by returning { data: null } from the handler.
+export interface TableQueryBuilder {
+  select(columns: string): TableQueryBuilder;
+  eq(column: string, value: unknown): TableQueryBuilder;
+  maybeSingle(): Promise<RpcResult>;
+}
+
 export interface FakeSupabaseClient {
   user: { id: string } | null;
   calls: Array<{ fn: string; params: Record<string, unknown> }>;
+  queries: Array<TableQuery>;
   handlers: Map<string, RpcHandler>;
+  tableHandlers: Map<string, TableHandler>;
   auth: {
     getUser(): Promise<{ data: { user: { id: string } | null }; error: null }>;
   };
   rpc(fn: string, params: Record<string, unknown>): Promise<RpcResult>;
+  from(table: string): TableQueryBuilder;
 }
 
 /**
@@ -52,7 +76,9 @@ export function makeFakeClient(): FakeSupabaseClient {
   const client: FakeSupabaseClient = {
     user: { id: "00000000-0000-4000-8000-000000000001" },
     calls: [],
+    queries: [],
     handlers: new Map(),
+    tableHandlers: new Map(),
     auth: {
       async getUser() {
         return { data: { user: client.user }, error: null };
@@ -65,6 +91,29 @@ export function makeFakeClient(): FakeSupabaseClient {
         throw new Error(`unexpected rpc call: ${fn}`);
       }
       return handler(params);
+    },
+    from(table) {
+      const query: TableQuery = { table, select: "*", eqColumn: "", eqValue: undefined };
+      const builder: TableQueryBuilder = {
+        select(columns) {
+          query.select = columns;
+          return builder;
+        },
+        eq(column, value) {
+          query.eqColumn = column;
+          query.eqValue = value;
+          return builder;
+        },
+        async maybeSingle() {
+          client.queries.push(query);
+          const handler = client.tableHandlers.get(table);
+          if (!handler) {
+            throw new Error(`unexpected table query: ${table}`);
+          }
+          return handler(query);
+        },
+      };
+      return builder;
     },
   };
   return client;
