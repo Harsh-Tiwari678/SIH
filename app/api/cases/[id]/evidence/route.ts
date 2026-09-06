@@ -10,6 +10,10 @@ import {
   sanitizeFileName,
   sha256Hex,
 } from "@/lib/storage";
+import {
+  persistedVersionIdFromResponse,
+  requestPendingAnchor,
+} from "@/lib/blockchain/upload-integration";
 
 export const runtime = "nodejs";
 
@@ -215,10 +219,49 @@ export async function POST(
     );
   }
 
+  // 4c. produce the blockchain anchor's PENDING intent, synchronously inside
+  //     this request and BEFORE the 201 returns. This is a plain DB-only RPC
+  //     (Ethereum is never contacted here): it commits the durable fact that
+  //     this version is to be anchored, so "pending" cannot be lost if the
+  //     process dies after the response. NO work is ever fired in the
+  //     background after the response — serverless runtimes may tear down the
+  //     context (and with it the request-scoped session) the moment the
+  //     response is sent, so deferred work must not be relied upon. On-chain
+  //     submission happens later through a separate, retriable trigger
+  //     (POST /api/cases/[id]/evidence/[documentVersionId]/anchor).
+  const persistedVersionId = persistedVersionIdFromResponse(data);
+
+  let anchorField: Record<string, unknown> | undefined;
+  if (persistedVersionId) {
+    const pendingAnchor = await requestPendingAnchor(
+      supabase,
+      persistedVersionId,
+    );
+    if (pendingAnchor) {
+      // The anchor id (and its 'pending' state) came from the RPC response,
+      // i.e. from the actually committed row, never from the request.
+      anchorField =
+        pendingAnchor.status === "pending"
+          ? {
+              status: "pending",
+              anchor_id: pendingAnchor.anchorId,
+              document_version_id: persistedVersionId,
+            }
+          : {
+              status: "already_anchored",
+              document_version_id: persistedVersionId,
+            };
+    }
+  }
+
   // Convention: POST endpoints return the created row(s). Both the evidence
   // record and its first version are returned (create_evidence returns a
-  // single jsonb containing both).
-  return NextResponse.json(data, { status: 201 });
+  // single jsonb containing both); when a pending anchor row was committed,
+  // its honest DB state is reported — never "scheduled", since nothing was
+  // deferred. If the anchor row could not be created, the evidence is still
+  // valid and the anchor is simply not reported (a later trigger creates it).
+  const body = anchorField ? { ...data, anchor: anchorField } : data;
+  return NextResponse.json(body, { status: 201 });
 }
 
 // RPC exceptions are exact, known codes; the includes-style checks follow the

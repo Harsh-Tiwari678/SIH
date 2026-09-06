@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Isolated Hardhat workspace with its own tooling + generated artifacts.
+    "blockchain/**",
   ]),
 ]);
 
