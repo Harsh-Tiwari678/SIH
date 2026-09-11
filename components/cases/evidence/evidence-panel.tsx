@@ -70,6 +70,7 @@ export function EvidencePanel({
         evidenceId={evidenceId}
         myRole={myRole}
         caseOpen={caseStatusOpen(caseDetail.status)}
+        caseMembers={caseDetail.case_members ?? []}
         onBack={onBack}
       />
     )

@@ -11,6 +11,8 @@ import {
   ShieldCheck,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { CopyButton } from "@/components/cases/evidence/copy-button"
 import { EvidenceAuditSection } from "@/components/cases/evidence/evidence-audit-section"
 import { FileAccessPanel } from "@/components/cases/evidence/file-access-panel"
@@ -24,6 +26,7 @@ import type {
   CustodyEntry,
   EvidenceVersion,
 } from "@/lib/evidence-serialization"
+import type { CaseMemberDetail } from "@/components/cases/case-detail"
 import {
   type AnchorOutcomeBody,
   type VerificationFrame,
@@ -55,12 +58,14 @@ export function EvidenceDetail({
   evidenceId,
   myRole,
   caseOpen,
+  caseMembers,
   onBack,
 }: {
   caseId: string
   evidenceId: string
   myRole: string | null
   caseOpen: boolean
+  caseMembers: CaseMemberDetail[]
   onBack: () => void
 }) {
   const [state, setState] = React.useState<DetailState>({ status: "loading" })
@@ -191,7 +196,15 @@ export function EvidenceDetail({
         onVerified={() => setReloadKey((k) => k + 1)}
       />
 
-      <CustodyPanel custody={custody} />
+      <CustodyPanel
+        custody={custody}
+        caseId={caseId}
+        evidenceId={evidenceId}
+        myRole={myRole}
+        caseOpen={caseOpen}
+        caseMembers={caseMembers}
+        onRecorded={() => setReloadKey((k) => k + 1)}
+      />
 
       <EvidenceAuditSection caseId={caseId} evidenceId={evidenceId} />
     </div>
@@ -742,19 +755,247 @@ const CUSTODY_ACTION_LABEL: Record<string, string> = {
   archived: "Archived",
 }
 
-function CustodyPanel({ custody }: { custody: CustodyEntry[] }) {
+const RECORDABLE_CUSTODY_ACTIONS: Array<{ value: string; label: string }> = [
+  { value: "transferred", label: "Transfer" },
+  { value: "returned", label: "Return" },
+  { value: "released", label: "Release" },
+]
+
+type CustodyRecordState =
+  | { status: "idle" }
+  | { status: "recording" }
+  | { status: "success" }
+  | { status: "error"; message: string }
+
+function CustodyPanel({
+  custody,
+  caseId,
+  evidenceId,
+  myRole,
+  caseOpen,
+  caseMembers,
+  onRecorded,
+}: {
+  custody: CustodyEntry[]
+  caseId: string
+  evidenceId: string
+  myRole: string | null
+  caseOpen: boolean
+  caseMembers: CaseMemberDetail[]
+  onRecorded: () => void
+}) {
+  const canRecord =
+    caseOpen && (myRole === "lead" || myRole === "investigator")
+
+  const [recordState, setRecordState] = React.useState<CustodyRecordState>({
+    status: "idle",
+  })
+  const [action, setAction] = React.useState("transferred")
+  const [toProfileId, setToProfileId] = React.useState("")
+  const [location, setLocation] = React.useState("")
+  const [notes, setNotes] = React.useState("")
+
+  const needsTarget = action === "transferred" || action === "returned"
+
+  function resetForm() {
+    setAction("transferred")
+    setToProfileId("")
+    setLocation("")
+    setNotes("")
+    setRecordState({ status: "idle" })
+  }
+
+  async function recordEvent(event: React.FormEvent) {
+    event.preventDefault()
+    if (!canRecord) return
+    setRecordState({ status: "recording" })
+    try {
+      const res = await fetch(
+        `/api/cases/${caseId}/evidence/${evidenceId}/custody`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action,
+            toProfileId: needsTarget ? toProfileId : null,
+            fromProfileId: null,
+            documentVersionId: null,
+            location: location.trim() === "" ? null : location.trim(),
+            notes: notes.trim() === "" ? null : notes.trim(),
+          }),
+        },
+      )
+      const data = (await res.json().catch(() => ({}))) as {
+        custody?: { id: string }
+        error?: string
+      }
+      if (!res.ok || !data.custody) {
+        setRecordState({
+          status: "error",
+          message: data.error ?? "Could not record the custody event.",
+        })
+        return
+      }
+      setRecordState({ status: "success" })
+      resetForm()
+      onRecorded()
+    } catch {
+      setRecordState({
+        status: "error",
+        message: "Could not record the custody event. Try again.",
+      })
+    }
+  }
+
   return (
     <div>
       <h4 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
         <History aria-hidden className="size-4 text-muted-foreground" />
         Chain of custody
       </h4>
+
+      <p className="mt-1 text-xs text-muted-foreground">
+        Chain of custody records who handled this evidence. Transfer, return and
+        release events are attributable to the recording member; receipts are
+        written automatically at intake.
+      </p>
+
+      {canRecord ? (
+        <form
+          onSubmit={recordEvent}
+          className="mt-3 overflow-hidden rounded-lg border border-border/80 bg-background shadow-sm"
+        >
+          <div className="border-b border-border/70 px-4 py-2.5">
+            <span className="text-sm font-medium text-foreground">
+              Record custody event
+            </span>
+          </div>
+          <div className="grid gap-3 px-4 py-3 sm:grid-cols-2">
+            <label className="flex flex-col gap-1.5 text-xs font-medium text-muted-foreground">
+              Action
+              <select
+                value={action}
+                onChange={(event) => {
+                  setAction(event.target.value)
+                  setRecordState({ status: "idle" })
+                }}
+                className="h-9 rounded-md border border-input bg-background px-2.5 text-sm text-foreground shadow-sm outline-none transition-colors duration-150 ease-out-quick focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              >
+                {RECORDABLE_CUSTODY_ACTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {needsTarget ? (
+              <label className="flex flex-col gap-1.5 text-xs font-medium text-muted-foreground">
+                Receiving member
+                <select
+                  value={toProfileId}
+                  onChange={(event) => {
+                    setToProfileId(event.target.value)
+                    setRecordState({ status: "idle" })
+                  }}
+                  className="h-9 rounded-md border border-input bg-background px-2.5 text-sm text-foreground shadow-sm outline-none transition-colors duration-150 ease-out-quick focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                >
+                  <option value="" disabled>
+                    Select a member
+                  </option>
+                  {caseMembers.map((member) => (
+                    <option key={member.profile_id} value={member.profile_id}>
+                      {member.profiles?.full_name ?? member.profile_id}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <label className="flex flex-col gap-1.5 text-xs font-medium text-muted-foreground">
+                Release
+                <span className="flex h-9 items-center text-sm font-normal text-muted-foreground">
+                  Terminates possession; no receiving member.
+                </span>
+              </label>
+            )}
+
+            <label className="flex flex-col gap-1.5 text-xs font-medium text-muted-foreground">
+              Location
+              <Input
+                value={location}
+                onChange={(event) => {
+                  setLocation(event.target.value)
+                  setRecordState({ status: "idle" })
+                }}
+                placeholder="e.g. Evidence room, almirah 3"
+                maxLength={500}
+                className="h-9"
+              />
+            </label>
+
+            <label className="flex flex-col gap-1.5 text-xs font-medium text-muted-foreground sm:col-span-2">
+              Notes
+              <Textarea
+                value={notes}
+                onChange={(event) => {
+                  setNotes(event.target.value)
+                  setRecordState({ status: "idle" })
+                }}
+                placeholder="Optional context for this event"
+                maxLength={2000}
+                rows={2}
+              />
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 border-t border-border/70 px-4 py-2.5">
+            <Button
+              type="submit"
+              size="sm"
+              disabled={
+                recordState.status === "recording" ||
+                (needsTarget && toProfileId === "")
+              }
+            >
+              {recordState.status === "recording" ? (
+                <Loader2 className="size-3.5 animate-spin" aria-hidden />
+              ) : (
+                <History aria-hidden className="size-3.5" />
+              )}
+              {recordState.status === "recording"
+                ? "Recording"
+                : `Record ${CUSTODY_ACTION_LABEL[action] ?? action}`}
+            </Button>
+
+            {recordState.status === "success" ? (
+              <span
+                role="status"
+                className="flex items-center gap-1.5 text-sm text-success"
+              >
+                <CheckCircle2 aria-hidden className="size-4" />
+                Custody event recorded.
+              </span>
+            ) : null}
+
+            {recordState.status === "error" ? (
+              <span
+                role="alert"
+                className="flex items-center gap-1.5 text-sm text-danger"
+              >
+                <AlertCircle aria-hidden className="size-4" />
+                {recordState.message}
+              </span>
+            ) : null}
+          </div>
+        </form>
+      ) : null}
+
       {custody.length === 0 ? (
-        <p className="mt-2 rounded-lg border border-border/80 bg-background px-4 py-5 text-sm text-muted-foreground">
+        <p className="mt-3 rounded-lg border border-border/80 bg-background px-4 py-5 text-sm text-muted-foreground">
           No custody events have been recorded for this evidence item.
         </p>
       ) : (
-        <div className="mt-2 overflow-hidden rounded-lg border border-border/80 bg-background shadow-sm">
+        <div className="mt-3 overflow-hidden rounded-lg border border-border/80 bg-background shadow-sm">
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-sm">
               <thead>
@@ -764,6 +1005,12 @@ function CustodyPanel({ custody }: { custody: CustodyEntry[] }) {
                   </th>
                   <th scope="col" className="hidden px-3 py-2 font-medium sm:table-cell">
                     Actor
+                  </th>
+                  <th scope="col" className="hidden px-3 py-2 font-medium lg:table-cell">
+                    From
+                  </th>
+                  <th scope="col" className="hidden px-3 py-2 font-medium lg:table-cell">
+                    To
                   </th>
                   <th scope="col" className="hidden px-3 py-2 font-medium md:table-cell">
                     Location
@@ -785,6 +1032,16 @@ function CustodyPanel({ custody }: { custody: CustodyEntry[] }) {
                       </span>
                       <span className="ml-2 font-mono text-xs text-muted-foreground">
                         {shortHash(entry.actor_id, 5)}
+                      </span>
+                    </td>
+                    <td className="hidden py-2.5 pl-3 pr-3 lg:table-cell">
+                      <span className="text-muted-foreground">
+                        {entry.from_name ?? "—"}
+                      </span>
+                    </td>
+                    <td className="hidden py-2.5 pl-3 pr-3 lg:table-cell">
+                      <span className="text-muted-foreground">
+                        {entry.to_name ?? "—"}
                       </span>
                     </td>
                     <td className="hidden max-w-0 py-2.5 pl-3 pr-3 md:table-cell">
@@ -816,9 +1073,6 @@ function CustodyPanel({ custody }: { custody: CustodyEntry[] }) {
           ) : null}
         </div>
       )}
-      <p className="mt-2 text-xs text-muted-foreground">
-        Chain of custody records who handled each version of this evidence.
-      </p>
     </div>
   )
 }

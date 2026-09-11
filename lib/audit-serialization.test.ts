@@ -33,6 +33,11 @@ describe("auditActionLabel", () => {
       ["evidence.anchor_reconciled", "Anchor reconciled"],
       ["evidence.custody_received", "Evidence received into custody"],
       ["evidence.accessed", "Evidence accessed"],
+      ["custody.transferred", "Custody transferred"],
+      ["custody.returned", "Custody returned"],
+      ["custody.verified", "Custody verified"],
+      ["custody.released", "Custody released"],
+      ["custody.archived", "Custody archived"],
     ];
     for (const [action, label] of known) {
       assert.equal(auditActionLabel(action), label);

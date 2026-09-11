@@ -65,6 +65,11 @@ const ACTION_LABELS: Record<string, string> = {
   "evidence.anchor_reconciled": "Anchor reconciled",
   "evidence.custody_received": "Evidence received into custody",
   "evidence.accessed": "Evidence accessed",
+  "custody.transferred": "Custody transferred",
+  "custody.returned": "Custody returned",
+  "custody.verified": "Custody verified",
+  "custody.released": "Custody released",
+  "custody.archived": "Custody archived",
 };
 
 export function auditActionLabel(action: string): string {
@@ -119,6 +124,10 @@ const AUDIT_META_ALLOW_LIST: Array<{ key: string; label: string }> = [
   { key: "sha256", label: "SHA-256" },
   { key: "error_message", label: "Error" },
   { key: "notes", label: "Notes" },
+  { key: "action", label: "Action" },
+  { key: "from_profile_name", label: "From" },
+  { key: "to_profile_name", label: "To" },
+  { key: "location", label: "Location" },
 ];
 
 const META_VALUE_MAX = 200;
