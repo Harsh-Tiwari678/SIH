@@ -15,9 +15,9 @@ export async function GET() {
   }
 
   // 2. list — query the cases table through the authenticated session so the
-  //    existing `cases_select_creator_or_member` RLS policy filters to only the
-  //    cases this user is allowed to see. No service-role key is used; access
-  //    is enforced by the database, not the application.
+  //    existing `cases_select_member_or_org_admin` RLS policy filters to only
+  //    the cases this user is allowed to see. No service-role key is used;
+  //    access is enforced by the database, not the application.
   const { data: cases, error } = await supabase
     .from("cases")
     .select("id, case_number, title, description, status, created_at, updated_at")
@@ -55,7 +55,12 @@ export async function POST(request: Request) {
   }
 
   // 3. validate input — parse and sanity-check the request body.
-  let body: { case_number?: unknown; title?: unknown; description?: unknown };
+  let body: {
+    case_number?: unknown;
+    title?: unknown;
+    description?: unknown;
+    org_id?: unknown;
+  };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -90,11 +95,38 @@ export async function POST(request: Request) {
     );
   }
 
-  // 4 & 5. business operation + audit — both run inside the trusted
+  // 4. resolve the organization the case belongs to. A client-supplied
+  // org_id is only a proposal: the create_case RPC validates that the caller
+  // is a member of that organization before writing anything. When the caller
+  // belongs to exactly one organization, it can be resolved automatically;
+  // otherwise the request must say which organization the case is for.
+  const org_id = typeof body.org_id === "string" ? body.org_id.trim() : "";
+  let resolvedOrgId = org_id;
+  if (!resolvedOrgId) {
+    const { data: orgs } = await supabase
+      .from("organizations")
+      .select("id");
+    if (!orgs || orgs.length !== 1) {
+      return NextResponse.json(
+        {
+          error:
+            orgs && orgs.length > 1
+              ? "Multiple organizations: org_id is required"
+              : "Must belong to an organization to create a case",
+        },
+        { status: orgs && orgs.length > 1 ? 400 : 403 },
+      );
+    }
+    resolvedOrgId = orgs[0].id;
+  }
+
+  // 5 & 6. business operation + audit — both run inside the trusted
   // create_case SECURITY DEFINER RPC, atomically, with identity derived from
   // auth.uid() (never from client input). created_by / profile_id / role are
-  // not reachable by the client on this path.
+  // not reachable by the client on this path. The org membership check lives
+  // in the RPC, so a forged org_id cannot create a case in another org.
   const { data, error } = await supabase.rpc("create_case", {
+    p_org_id: resolvedOrgId,
     p_case_number: case_number,
     p_title: title,
     p_description: description,
@@ -112,8 +144,15 @@ export async function POST(request: Request) {
 
 function rpcStatus(message: string): number {
   if (message.includes("not_authenticated")) return 401;
-  if (message.includes("profile_not_found")) return 403;
-  if (message.includes("case_number_required") || message.includes("title_required")) {
+  if (message.includes("profile_not_found") || message.includes("not_org_member")) {
+    return 403;
+  }
+  if (
+    message.includes("case_number_required") ||
+    message.includes("title_required") ||
+    message.includes("org_required") ||
+    message.includes("org_not_found")
+  ) {
     return 400;
   }
   if (message.includes("duplicate key") || message.toLowerCase().includes("unique")) {

@@ -14,6 +14,10 @@ import {
   persistedVersionIdFromResponse,
   requestPendingAnchor,
 } from "@/lib/blockchain/upload-integration";
+import {
+  serializeEvidenceListItem,
+  type EvidenceListRawRow,
+} from "@/lib/evidence-serialization";
 
 export const runtime = "nodejs";
 
@@ -31,6 +35,64 @@ function formText(form: FormData, name: string, maxLength: number): string | und
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   return trimmed.slice(0, maxLength);
+}
+
+export async function GET(
+  _request: Request,
+  ctx: RouteContext<"/api/cases/[id]/evidence">,
+) {
+  const { id: caseId } = await ctx.params;
+
+  const supabase = await createClient();
+
+  // 1. authenticate — resolve the session from the request cookies.
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // 2. authorize — the user must have an application profile.
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("id", user.id)
+    .maybeSingle();
+  if (!profile) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  // 3. validate — shape only. Authorization for the listed rows is enforced by
+  //    the existing evidence_select_case_members RLS policy: an actor outside
+  //    the case sees an empty list (indistinguishable from a case with no
+  //    evidence), so nothing about the case leaks. The embedded creator/
+  //    uploader names resolve through profiles_select_self_or_shared_case; the
+  //    FK hints disambiguate the profiles embeds the same way the case detail
+  //    query does.
+  if (!UUID_PATTERN.test(caseId)) {
+    return NextResponse.json({ error: "Invalid case id" }, { status: 400 });
+  }
+
+  const { data, error } = await supabase
+    .from("evidence")
+    .select(
+      "id, case_id, evidence_number, title, description, type, status, created_by, created_at, updated_at, creator:profiles!evidence_created_by_fkey(id, full_name), document_versions(id, version, file_name, mime_type, file_size_bytes, sha256, uploaded_at)",
+    )
+    .eq("case_id", caseId)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return NextResponse.json(
+      { error: "Failed to load evidence" },
+      { status: 500 },
+    );
+  }
+
+  const evidence = (data ?? []).map((row) =>
+    serializeEvidenceListItem(row as unknown as EvidenceListRawRow),
+  );
+  return NextResponse.json({ evidence }, { status: 200 });
 }
 
 export async function POST(
@@ -226,9 +288,9 @@ export async function POST(
   //     process dies after the response. NO work is ever fired in the
   //     background after the response — serverless runtimes may tear down the
   //     context (and with it the request-scoped session) the moment the
-  //     response is sent, so deferred work must not be relied upon. On-chain
-  //     submission happens later through a separate, retriable trigger
-  //     (POST /api/cases/[id]/evidence/[documentVersionId]/anchor).
+//     response is sent, so deferred work must not be relied upon. On-chain
+//     submission happens later through a separate, retriable trigger
+//     (POST /api/cases/[id]/evidence/[evidenceId]/anchor).
   const persistedVersionId = persistedVersionIdFromResponse(data);
 
   let anchorField: Record<string, unknown> | undefined;
