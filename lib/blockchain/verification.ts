@@ -20,8 +20,10 @@
 //     service-role key is used.
 //   * Reconciled anchors legitimately carry tx_hash = NULL; nothing here ever
 //     fabricates a transaction hash.
-//   * Verification is GET-safe: it performs no RPC mutations, no audit inserts
-//     (reads are not audited, matching the rest of the system).
+//   * Verification is GET-safe: this module performs no RPC mutations and no
+//     audit inserts. The read is audited by the route handler via
+//     record_verification_event (best-effort, never blocking the read); that
+//     SECURITY DEFINER RPC re-derives the actor from the session.
 
 import { createClient } from "@/lib/supabase/server";
 import {
