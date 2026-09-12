@@ -730,6 +730,48 @@ describe("POST /api/organizations/[id]/members", () => {
     assert.equal((await res.json()).error, "Profile not found");
   });
 
+  it("rejects a caller without an application profile", async () => {
+    const client = makeOrgClient();
+    client.tableHandlers.set("profiles", () => rpcResult(null));
+    orgClientHolder.current = client;
+
+    const res = await makePost({ profile_id: TARGET_ID, role_in_org: "member" });
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, "Forbidden");
+    assert.equal(client.calls.length, 0);
+  });
+
+  it("maps a nonexistent organization to 404 (existence never leaks)", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.rpcHandlers.set("add_organization_member", () =>
+      rpcError("organization_not_found"),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makePost({ profile_id: TARGET_ID, role_in_org: "member" });
+    assert.equal(res.status, 404);
+    assert.equal((await res.json()).error, "Organization not found");
+  });
+
+  it("maps an RPC-raised role_not_allowed to 400", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    // Defense in depth: role vocabulary is validated client-side before the
+    // RPC, but a DB-side rejection still maps to a faithful 400.
+    client.rpcHandlers.set("add_organization_member", () =>
+      rpcError("role_not_allowed"),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makePost({ profile_id: TARGET_ID, role_in_org: "member" });
+    assert.equal(res.status, 400);
+    assert.equal(
+      (await res.json()).error,
+      "role_in_org must be one of admin, investigator, member",
+    );
+  });
+
   it("never forwards a client-supplied actor id to the RPC", async () => {
     const client = makeOrgClient();
     installProfile(client);
@@ -858,6 +900,48 @@ describe("PATCH /api/organizations/[id]/members/[profileId]", () => {
     assert.equal((await res.json()).error, "The last organization admin cannot be demoted");
   });
 
+  it("rejects a caller without an application profile", async () => {
+    const client = makeOrgClient();
+    client.tableHandlers.set("profiles", () => rpcResult(null));
+    orgClientHolder.current = client;
+
+    const res = await makePatch({ role_in_org: "member" });
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, "Forbidden");
+    assert.equal(client.calls.length, 0);
+  });
+
+  it("maps a nonexistent organization to 404 (existence never leaks)", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.rpcHandlers.set("change_organization_member_role", () =>
+      rpcError("organization_not_found"),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makePatch({ role_in_org: "member" });
+    assert.equal(res.status, 404);
+    assert.equal((await res.json()).error, "Organization not found");
+  });
+
+  it("maps an RPC-raised role_not_allowed to 400", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    // Defense in depth: role vocabulary is validated client-side before the
+    // RPC, but a DB-side rejection still maps to a faithful 400.
+    client.rpcHandlers.set("change_organization_member_role", () =>
+      rpcError("role_not_allowed"),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makePatch({ role_in_org: "member" });
+    assert.equal(res.status, 400);
+    assert.equal(
+      (await res.json()).error,
+      "role_in_org must be one of admin, investigator, member",
+    );
+  });
+
   it("never forwards a client-supplied actor id to the RPC", async () => {
     const client = makeOrgClient();
     installProfile(client);
@@ -975,6 +1059,30 @@ describe("DELETE /api/organizations/[id]/members/[profileId]", () => {
     const res = await makeDelete();
     assert.equal(res.status, 409);
     assert.equal((await res.json()).error, "The last organization admin cannot be removed");
+  });
+
+  it("rejects a caller without an application profile", async () => {
+    const client = makeOrgClient();
+    client.tableHandlers.set("profiles", () => rpcResult(null));
+    orgClientHolder.current = client;
+
+    const res = await makeDelete();
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, "Forbidden");
+    assert.equal(client.calls.length, 0);
+  });
+
+  it("maps a nonexistent organization to 404 (existence never leaks)", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.rpcHandlers.set("remove_organization_member", () =>
+      rpcError("organization_not_found"),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makeDelete();
+    assert.equal(res.status, 404);
+    assert.equal((await res.json()).error, "Organization not found");
   });
 
   it("accepts no request body — the actor cannot be spoofed", async () => {
