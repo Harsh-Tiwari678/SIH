@@ -38,6 +38,10 @@ describe("auditActionLabel", () => {
       ["custody.verified", "Custody verified"],
       ["custody.released", "Custody released"],
       ["custody.archived", "Custody archived"],
+      ["organization.created", "Organization created"],
+      ["organization.member_added", "Member added"],
+      ["organization.member_role_changed", "Member role changed"],
+      ["organization.member_removed", "Member removed"],
     ];
     for (const [action, label] of known) {
       assert.equal(auditActionLabel(action), label);
@@ -58,6 +62,8 @@ describe("auditEntityTypeLabel", () => {
     assert.equal(auditEntityTypeLabel("evidence"), "Evidence");
     assert.equal(auditEntityTypeLabel("document_version"), "Version");
     assert.equal(auditEntityTypeLabel("blockchain_anchor"), "Blockchain anchor");
+    assert.equal(auditEntityTypeLabel("organization"), "Organization");
+    assert.equal(auditEntityTypeLabel("organization_member"), "Organization member");
     assert.equal(auditEntityTypeLabel("unexpected_type"), "unexpected_type");
   });
 });
@@ -155,6 +161,25 @@ describe("sanitizeAuditMeta", () => {
     assert.deepEqual(sanitizeAuditMeta({}), []);
     assert.deepEqual(sanitizeAuditMeta({ nested: { a: 1 }, list: [1], empty: "" }), []);
   });
+
+  it("renders organization member role meta with its own labels", () => {
+    const items = sanitizeAuditMeta({
+      old_role_in_org: "investigator",
+      new_role_in_org: "admin",
+      removed_role_in_org: "member",
+      role_in_org: "member",
+      name: "Alpha Bureau",
+      slug: "alpha-bureau",
+    });
+    assert.deepEqual(items, [
+      { key: "old_role_in_org", label: "Role from", value: "investigator" },
+      { key: "new_role_in_org", label: "Role to", value: "admin" },
+      { key: "removed_role_in_org", label: "Role removed", value: "member" },
+      { key: "role_in_org", label: "Role", value: "member" },
+      { key: "name", label: "Name", value: "Alpha Bureau" },
+      { key: "slug", label: "Slug", value: "alpha-bureau" },
+    ]);
+  });
 });
 
 describe("verificationAuditOutcome", () => {
@@ -209,6 +234,37 @@ describe("serializeAuditEvent", () => {
     assert.deepEqual(item.meta, [
       { key: "previous_status", label: "Status from", value: "received" },
       { key: "new_status", label: "Status to", value: "verified" },
+    ]);
+  });
+
+  it("serializes an organization member role-change event and keeps storage_key out", () => {
+    const row = {
+      id: "a2",
+      action: "organization.member_role_changed",
+      entity_type: "organization_member",
+      entity_id: "om1",
+      actor_id: "u1",
+      actor_name: "Harsh Tiwari",
+      case_id: null,
+      evidence_id: null,
+      entity_label: "Aarav Sharma",
+      created_at: "2026-09-12T09:00:00Z",
+      meta: {
+        old_role_in_org: "member",
+        new_role_in_org: "admin",
+        storage_key: "org/secret/location",
+        raw: { nested: true },
+      },
+    };
+    const item = serializeAuditEvent(row);
+    assert.equal(item.action, "organization.member_role_changed");
+    assert.equal(item.action_label, "Member role changed");
+    assert.equal(item.entity_type_label, "Organization member");
+    assert.equal(item.entity_label, "Aarav Sharma");
+    assert.equal(item.actor_name, "Harsh Tiwari");
+    assert.deepEqual(item.meta, [
+      { key: "old_role_in_org", label: "Role from", value: "member" },
+      { key: "new_role_in_org", label: "Role to", value: "admin" },
     ]);
   });
 });

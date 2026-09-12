@@ -22,6 +22,8 @@ export const AUDIT_ENTITY_TYPES = [
   "evidence",
   "document_version",
   "blockchain_anchor",
+  "organization",
+  "organization_member",
 ] as const;
 export type AuditEntityType = (typeof AUDIT_ENTITY_TYPES)[number];
 
@@ -70,6 +72,10 @@ const ACTION_LABELS: Record<string, string> = {
   "custody.verified": "Custody verified",
   "custody.released": "Custody released",
   "custody.archived": "Custody archived",
+  "organization.created": "Organization created",
+  "organization.member_added": "Member added",
+  "organization.member_role_changed": "Member role changed",
+  "organization.member_removed": "Member removed",
 };
 
 export function auditActionLabel(action: string): string {
@@ -89,6 +95,8 @@ const ENTITY_TYPE_LABELS: Record<string, string> = {
   evidence: "Evidence",
   document_version: "Version",
   blockchain_anchor: "Blockchain anchor",
+  organization: "Organization",
+  organization_member: "Organization member",
 };
 
 export function auditEntityTypeLabel(entityType: string): string {
@@ -128,6 +136,12 @@ const AUDIT_META_ALLOW_LIST: Array<{ key: string; label: string }> = [
   { key: "from_profile_name", label: "From" },
   { key: "to_profile_name", label: "To" },
   { key: "location", label: "Location" },
+  { key: "old_role_in_org", label: "Role from" },
+  { key: "new_role_in_org", label: "Role to" },
+  { key: "removed_role_in_org", label: "Role removed" },
+  { key: "role_in_org", label: "Role" },
+  { key: "name", label: "Name" },
+  { key: "slug", label: "Slug" },
 ];
 
 const META_VALUE_MAX = 200;
