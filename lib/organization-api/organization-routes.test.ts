@@ -19,11 +19,15 @@ import {
   GET as listOrganizations,
 } from "../../app/api/organizations/route.ts";
 import {
+  POST as createOrganization,
+} from "../../app/api/organizations/route.ts";
+import {
   orgClientHolder,
   makeOrgClient,
   type OrgFakeSupabaseClient,
   type OrgTableQuery,
 } from "./test-support/org-server-stub.ts";
+import { deriveSlug, isValidSlug } from "./organization-slug.ts";
 
 // ---------------------------------------------------------------------------
 // Route-level unit tests for the organization member / audit API:
@@ -97,6 +101,14 @@ async function makePost(body: unknown, orgId = ORG_ALPHA): Promise<Response> {
     body: typeof body === "string" ? body : JSON.stringify(body),
   });
   return addMember(req, ctx as never);
+}
+
+async function makeOrgPost(body: unknown): Promise<Response> {
+  const req = new Request("http://localhost/api/organizations", {
+    method: "POST",
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
+  return createOrganization(req);
 }
 
 async function makePatch(
@@ -307,6 +319,299 @@ describe("GET /api/organizations", () => {
     const serialized = JSON.stringify(body);
     assert.ok(!serialized.includes("connection reset"));
     assert.ok(!serialized.includes("credentials"));
+  });
+});
+
+// =============================================================================
+// CREATE ORGANIZATION — POST /api/organizations
+// =============================================================================
+
+const NEW_ORG_NAME = "Traffic Bureau";
+const NEW_ORG_SLUG = "traffic-bureau";
+const NEW_ORG_ID = "82000000-0000-0000-0000-0000000000C1";
+
+describe("POST /api/organizations", () => {
+  it("rejects an unauthenticated session with 401 before any RPC", async () => {
+    const client = makeOrgClient();
+    client.user = null;
+    orgClientHolder.current = client;
+
+    const res = await makeOrgPost({ name: NEW_ORG_NAME, slug: NEW_ORG_SLUG });
+    assert.equal(res.status, 401);
+    assert.equal((await res.json()).error, "Unauthorized");
+    assert.equal(client.calls.length, 0);
+  });
+
+  it("rejects a caller without an application profile", async () => {
+    const client = makeOrgClient();
+    client.tableHandlers.set("profiles", () => rpcResult(null));
+    orgClientHolder.current = client;
+
+    const res = await makeOrgPost({ name: NEW_ORG_NAME, slug: NEW_ORG_SLUG });
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, "Forbidden");
+    assert.equal(client.calls.length, 0);
+  });
+
+  it("rejects an invalid JSON body with 400 before the RPC", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    orgClientHolder.current = client;
+
+    const res = await makeOrgPost("{not json");
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, "Invalid JSON body");
+    assert.equal(client.calls.length, 0);
+  });
+
+  it("rejects a missing or blank name before the RPC", async () => {
+    const cases = [
+      {},
+      { name: "", slug: NEW_ORG_SLUG },
+      { name: "   ", slug: NEW_ORG_SLUG },
+      { name: 42, slug: NEW_ORG_SLUG },
+    ];
+    for (const body of cases) {
+      const client = makeOrgClient();
+      installProfile(client);
+      orgClientHolder.current = client;
+
+      const res = await makeOrgPost(body);
+      assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}`);
+      assert.equal((await res.json()).error, "Organization name is required");
+      assert.equal(client.calls.length, 0, `no RPC for ${JSON.stringify(body)}`);
+    }
+  });
+
+  it("rejects a missing or blank slug before the RPC", async () => {
+    const cases = [
+      { name: NEW_ORG_NAME },
+      { name: NEW_ORG_NAME, slug: "" },
+      { name: NEW_ORG_NAME, slug: "   " },
+      { name: NEW_ORG_NAME, slug: 7 },
+    ];
+    for (const body of cases) {
+      const client = makeOrgClient();
+      installProfile(client);
+      orgClientHolder.current = client;
+
+      const res = await makeOrgPost(body);
+      assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}`);
+      assert.equal((await res.json()).error, "Organization slug is required");
+      assert.equal(client.calls.length, 0, `no RPC for ${JSON.stringify(body)}`);
+    }
+  });
+
+  it("rejects slugs that do not match the URL-safe format before the RPC", async () => {
+    const invalidSlugs = [
+      "Bad Slug",
+      "bad--slug",
+      "-bad",
+      "bad-",
+      "bad_slug",
+      "bad/slug",
+      "b".repeat(64),
+      "b".repeat(70),
+    ];
+    for (const slug of invalidSlugs) {
+      const client = makeOrgClient();
+      installProfile(client);
+      orgClientHolder.current = client;
+
+      const res = await makeOrgPost({ name: NEW_ORG_NAME, slug });
+      assert.equal(res.status, 400, `expected 400 for slug ${slug}`);
+      assert.equal(
+        (await res.json()).error,
+        "Organization slug must be lowercase letters and digits separated by single hyphens, at most 63 characters",
+      );
+      assert.equal(client.calls.length, 0, `no RPC for slug ${slug}`);
+    }
+  });
+
+  it("normalizes the slug (trim + lowercase) before the RPC", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.rpcHandlers.set("create_organization", () =>
+      rpcResult(NEW_ORG_ID),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makeOrgPost({
+      name: NEW_ORG_NAME,
+      slug: "  Traffic-Bureau  ",
+    });
+
+    assert.equal(res.status, 201);
+    const call = client.calls.find((c) => c.fn === "create_organization");
+    assert.ok(call, "create_organization must be called");
+    assert.deepEqual(call!.params, {
+      p_name: NEW_ORG_NAME,
+      p_slug: NEW_ORG_SLUG,
+    });
+  });
+
+  it("creates an organization and returns 201 with the new organization id", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.rpcHandlers.set("create_organization", () =>
+      rpcResult(NEW_ORG_ID),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makeOrgPost({ name: NEW_ORG_NAME, slug: NEW_ORG_SLUG });
+    const body = await res.json();
+
+    assert.equal(res.status, 201);
+    assert.deepEqual(body.organization, { id: NEW_ORG_ID });
+    const call = client.calls.find((c) => c.fn === "create_organization");
+    assert.ok(call, "create_organization must be called");
+    assert.deepEqual(call!.params, {
+      p_name: NEW_ORG_NAME,
+      p_slug: NEW_ORG_SLUG,
+    });
+  });
+
+  it("never forwards a client-supplied actor id to the RPC", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.rpcHandlers.set("create_organization", () =>
+      rpcResult(NEW_ORG_ID),
+    );
+    orgClientHolder.current = client;
+
+    // A hostile body tries to smuggle actor/creator claims. They must be
+    // ignored: create_organization is called with only p_name/p_slug and the
+    // creator is derived from auth.uid() inside the RPC.
+    const res = await makeOrgPost({
+      name: NEW_ORG_NAME,
+      slug: NEW_ORG_SLUG,
+      created_by: "11111111-1111-1111-1111-111111111111",
+      actor_id: "22222222-2222-2222-2222-222222222222",
+      user_id: "33333333-3333-3333-3333-333333333333",
+      role: "superadmin",
+    });
+
+    assert.equal(res.status, 201);
+    const call = client.calls.find((c) => c.fn === "create_organization");
+    assert.deepEqual(call!.params, {
+      p_name: NEW_ORG_NAME,
+      p_slug: NEW_ORG_SLUG,
+    });
+  });
+
+  it("maps a duplicate slug to 409 without leaking internals", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.rpcHandlers.set("create_organization", () =>
+      rpcError("slug_taken"),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makeOrgPost({ name: NEW_ORG_NAME, slug: NEW_ORG_SLUG });
+    const body = await res.json();
+
+    assert.equal(res.status, 409);
+    assert.equal(body.error, "Organization slug is already in use");
+    assert.ok(!JSON.stringify(body).includes("slug_taken"));
+  });
+
+  it("maps RPC-raised validation codes to 400 (defense in depth)", async () => {
+    const codes = [
+      "organization_name_required",
+      "organization_slug_required",
+      "invalid_slug",
+    ];
+    for (const code of codes) {
+      const client = makeOrgClient();
+      installProfile(client);
+      client.rpcHandlers.set("create_organization", () => rpcError(code));
+      orgClientHolder.current = client;
+
+      const res = await makeOrgPost({
+        name: NEW_ORG_NAME,
+        slug: NEW_ORG_SLUG,
+      });
+      assert.equal(res.status, 400, `expected 400 for ${code}`);
+    }
+  });
+
+  it("maps RPC-raised not_authenticated to 401 and profile_not_found to 403", async () => {
+    for (const [code, status] of [
+      ["not_authenticated", 401],
+      ["profile_not_found", 403],
+    ] as const) {
+      const client = makeOrgClient();
+      installProfile(client);
+      client.rpcHandlers.set("create_organization", () => rpcError(code));
+      orgClientHolder.current = client;
+
+      const res = await makeOrgPost({
+        name: NEW_ORG_NAME,
+        slug: NEW_ORG_SLUG,
+      });
+      assert.equal(res.status, status, `expected ${status} for ${code}`);
+    }
+  });
+
+  it("maps an unknown DB failure to a safe 500 without echoing internals", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.rpcHandlers.set("create_organization", () =>
+      rpcError("connection reset by peer: secret db credentials"),
+    );
+    orgClientHolder.current = client;
+
+    const res = await makeOrgPost({ name: NEW_ORG_NAME, slug: NEW_ORG_SLUG });
+    const body = await res.json();
+
+    assert.equal(res.status, 500);
+    assert.equal(body.error, "Failed to create organization");
+    const serialized = JSON.stringify(body);
+    assert.ok(!serialized.includes("connection reset"));
+    assert.ok(!serialized.includes("credentials"));
+  });
+});
+
+// =============================================================================
+// SLUG HELPERS — deriveSlug / isValidSlug (create-org UX)
+// =============================================================================
+
+describe("organization slug helpers", () => {
+  it("derives a URL-safe slug from a display name", () => {
+    assert.equal(deriveSlug("Cyber Crime Cell"), "cyber-crime-cell");
+    assert.equal(deriveSlug("  Special   Cases  "), "special-cases");
+    assert.equal(deriveSlug("FOO__bar--baz!"), "foo-bar-baz");
+    assert.equal(deriveSlug("8 Special Group"), "8-special-group");
+  });
+
+  it("strips leading/trailing separators and caps length at 63", () => {
+    assert.equal(deriveSlug("-leading and trailing-"), "leading-and-trailing");
+    const long = deriveSlug("a".repeat(60) + " b".repeat(20));
+    assert.ok(long.length > 0 && long.length <= 63, `length ${long.length}`);
+    assert.ok(!long.endsWith("-"), "must not end with a hyphen after truncation");
+    assert.equal(long, "a".repeat(60) + "-b");
+  });
+
+  it("returns an empty string when nothing slug-safe remains", () => {
+    assert.equal(deriveSlug("---"), "");
+    assert.equal(deriveSlug("!!!"), "");
+    assert.equal(deriveSlug(""), "");
+  });
+
+  it("isValidSlug accepts the RPC format and rejects everything else", () => {
+    assert.equal(isValidSlug("traffic-bureau"), true);
+    assert.equal(isValidSlug("a"), true);
+    assert.equal(isValidSlug("a1-b2-c3"), true);
+    assert.equal(isValidSlug("b".repeat(63)), true);
+
+    assert.equal(isValidSlug(""), false);
+    assert.equal(isValidSlug("-lead"), false);
+    assert.equal(isValidSlug("trail-"), false);
+    assert.equal(isValidSlug("double--hyphen"), false);
+    assert.equal(isValidSlug("HasUpper"), false);
+    assert.equal(isValidSlug("has space"), false);
+    assert.equal(isValidSlug("under_score"), false);
+    assert.equal(isValidSlug("b".repeat(64)), false);
   });
 });
 

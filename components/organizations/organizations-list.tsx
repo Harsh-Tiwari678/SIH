@@ -4,6 +4,7 @@ import * as React from "react"
 import Link from "next/link"
 import { AlertTriangle, Building2 } from "lucide-react"
 import { formatDate } from "@/lib/format"
+import { NewOrganizationDialog } from "./new-organization-dialog"
 
 export type OrganizationRecord = {
   id: string
@@ -126,8 +127,8 @@ export function EmptyOrganizations() {
       icon={<Building2 aria-hidden className="size-4" />}
     >
       <p>
-        You are not a member of any organizations yet. Organizations you join
-        will appear here.
+        You are not a member of any organizations yet. Create your first
+        organization, or organizations you join will appear here.
       </p>
     </MessagePanel>
   )
@@ -179,6 +180,11 @@ export function OrganizationsList() {
   const [state, setState] = React.useState<OrganizationsState>({
     status: "loading",
   })
+  const [reloadToken, setReloadToken] = React.useState(0)
+
+  function refresh() {
+    setReloadToken((t) => t + 1)
+  }
 
   React.useEffect(() => {
     let cancelled = false
@@ -225,7 +231,7 @@ export function OrganizationsList() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [reloadToken])
 
   const n = state.status === "ready" ? state.organizations.length : 0
 
@@ -249,6 +255,9 @@ export function OrganizationsList() {
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
             {subheading}
           </p>
+        </div>
+        <div className="shrink-0">
+          <NewOrganizationDialog onCreated={refresh} />
         </div>
       </header>
 
