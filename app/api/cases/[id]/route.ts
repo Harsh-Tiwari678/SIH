@@ -233,6 +233,7 @@ function rpcStatus(message: string): number {
   if (message.includes("profile_not_found")) return 403;
   if (message.includes("case_not_found")) return 404;
   if (message.includes("not_lead")) return 403;
+  if (message.includes("transition_not_allowed")) return 409;
   if (
     message.includes("status_not_allowed") ||
     message.includes("title_required") ||
@@ -253,6 +254,9 @@ function rpcMessage(message: string): string {
   }
   if (message.includes("status_not_allowed")) {
     return "status must be one of draft, active, closed, archived";
+  }
+  if (message.includes("transition_not_allowed")) {
+    return "That case status transition is not allowed";
   }
   if (message.includes("title_required")) return "title is required";
   if (message.includes("title_too_long")) {

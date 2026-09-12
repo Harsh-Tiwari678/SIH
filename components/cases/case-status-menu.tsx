@@ -22,21 +22,63 @@ import {
 import { cn } from "@/lib/utils"
 import type { CaseDetail } from "@/components/cases/case-detail"
 
-const STATUS_OPTIONS = [
-  { value: "draft", label: "Draft", dot: "bg-muted-foreground/70" },
-  { value: "active", label: "Active", dot: "bg-success" },
-  { value: "closed", label: "Closed", dot: "bg-muted-foreground/70" },
-  { value: "archived", label: "Archived", dot: "bg-muted-foreground/40" },
-] as const
+// The server-side transition matrix (update_case) is the source of truth:
+//   draft    -> active
+//   active   -> draft | closed
+//   closed   -> active | archived     (reopen / archive)
+//   archived -> closed                (restore; NOT active)
+// The menu mirrors exactly those transitions; any other move is rejected by the
+// server, so the UI never offers one.
+const TRANSITIONS: Record<
+  string,
+  Array<{
+    target: string
+    label: string
+    confirm?: "close" | "reopen" | "archive" | "restore"
+  }>
+> = {
+  draft: [{ target: "active", label: "Active" }],
+  active: [
+    { target: "draft", label: "Draft" },
+    { target: "closed", label: "Closed", confirm: "close" },
+  ],
+  closed: [
+    { target: "active", label: "Active", confirm: "reopen" },
+    { target: "archived", label: "Archived", confirm: "archive" },
+  ],
+  archived: [{ target: "closed", label: "Closed", confirm: "restore" }],
+}
 
-const CONFIRM_COPY: Record<string, { title: string; body: string }> = {
-  closed: {
+const STATUS_DOTS: Record<string, string> = {
+  draft: "bg-muted-foreground/70",
+  active: "bg-success",
+  closed: "bg-muted-foreground/70",
+  archived: "bg-muted-foreground/40",
+}
+
+const CONFIRM_COPY: Record<
+  string,
+  { title: string; body: string; action: string }
+> = {
+  close: {
     title: "Close this case?",
-    body: "Closing a case marks it as no longer open. Members and evidence can no longer be added, and the closed status is recorded in the audit trail.",
+    body: "Closing a case marks it as no longer open. Members and evidence can no longer be added, and evidence, custody and anchoring actions are disabled until the case is reopened. The closed status is recorded in the audit trail.",
+    action: "Close case",
   },
-  archived: {
+  reopen: {
+    title: "Reopen this case?",
+    body: "Reopening returns the case to active. Members and evidence can be added again and evidence actions are re-enabled. The previous close remains in the audit trail.",
+    action: "Reopen case",
+  },
+  archive: {
     title: "Archive this case?",
-    body: "Archiving moves the case out of the active workflow. The case is never deleted — its records and audit trail remain intact and readable.",
+    body: "Archiving moves the case out of the active workflow. The case is never deleted — its records, evidence and audit trail remain intact and readable.",
+    action: "Archive case",
+  },
+  restore: {
+    title: "Restore this case?",
+    body: "Restoring returns an archived case to closed status. It stays closed until a lead reopens it. The case is never deleted and its records remain intact and readable.",
+    action: "Restore to closed",
   },
 }
 
@@ -49,9 +91,11 @@ export function CaseStatusMenu({
 }) {
   const [pending, setPending] = React.useState(false)
   const [confirmTarget, setConfirmTarget] = React.useState<
-    "closed" | "archived" | null
+    "close" | "reopen" | "archive" | "restore" | null
   >(null)
   const [formError, setFormError] = React.useState<string | null>(null)
+
+  const transitions = TRANSITIONS[caseDetail.status] ?? []
 
   async function applyStatus(value: string) {
     if (value === caseDetail.status || pending) return
@@ -79,13 +123,13 @@ export function CaseStatusMenu({
     }
   }
 
-  function handleSelect(value: string) {
-    if (value === caseDetail.status) return
-    if (value === "closed" || value === "archived") {
-      setConfirmTarget(value)
+  function handleSelect(transition: (typeof transitions)[number]) {
+    if (transition.target === caseDetail.status) return
+    if (transition.confirm) {
+      setConfirmTarget(transition.confirm)
       return
     }
-    applyStatus(value)
+    applyStatus(transition.target)
   }
 
   return (
@@ -102,19 +146,22 @@ export function CaseStatusMenu({
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuLabel>Move case to</DropdownMenuLabel>
-          {STATUS_OPTIONS.map((option) => {
-            const active = option.value === caseDetail.status
+          {transitions.map((transition) => {
+            const active = transition.target === caseDetail.status
             return (
               <DropdownMenuItem
-                key={option.value}
+                key={transition.target}
                 disabled={active}
-                onSelect={() => handleSelect(option.value)}
+                onSelect={() => handleSelect(transition)}
               >
                 <span
                   aria-hidden
-                  className={cn("size-1.5 rounded-full", option.dot)}
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    STATUS_DOTS[transition.target] ?? "bg-muted-foreground/70",
+                  )}
                 />
-                {option.label}
+                {transition.label}
                 {active ? (
                   <Check aria-hidden className="ml-auto size-4" />
                 ) : null}
@@ -130,7 +177,10 @@ export function CaseStatusMenu({
         pending={pending}
         formError={formError}
         onCancel={() => setConfirmTarget(null)}
-        onConfirm={() => confirmTarget && applyStatus(confirmTarget)}
+        onConfirm={() => {
+          const transition = transitions.find((t) => t.confirm === confirmTarget)
+          if (transition) applyStatus(transition.target)
+        }}
       />
 
       {formError && !confirmTarget ? (
@@ -151,7 +201,7 @@ function ConfirmStatusDialog({
   onConfirm,
 }: {
   caseNumber: string
-  target: "closed" | "archived" | null
+  target: "close" | "reopen" | "archive" | "restore" | null
   pending: boolean
   formError: string | null
   onCancel: () => void
@@ -192,7 +242,7 @@ function ConfirmStatusDialog({
             {pending ? (
               <Loader2 className="size-4 animate-spin" aria-hidden />
             ) : null}
-            {target === "closed" ? "Close case" : "Archive case"}
+            {copy?.action}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -206,6 +256,9 @@ function labelStatusError(message: string): string {
   }
   if (message.includes("Only the case lead")) {
     return "Only the case lead can change the status."
+  }
+  if (message.includes("status transition")) {
+    return "That change is not allowed in the case's current status."
   }
   if (message.includes("status")) {
     return "That status is not allowed."

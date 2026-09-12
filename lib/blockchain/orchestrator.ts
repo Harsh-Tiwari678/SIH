@@ -115,6 +115,12 @@ function classifyCreateRpcError(message: string): CreateAnchorOutcome | never {
   if (message.includes("not_authorized_to_anchor")) {
     throw new AnchorOrchestrationError("not_authorized_to_anchor", "Only the case lead or an investigator can anchor evidence");
   }
+  if (message.includes("case_not_open")) {
+    throw new AnchorOrchestrationError(
+      "case_not_open",
+      "This case is closed or archived; only a pending anchor created earlier can still be anchored",
+    );
+  }
   throw new AnchorOrchestrationError("rpc_error", "create_blockchain_anchor failed");
 }
 

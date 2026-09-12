@@ -280,6 +280,7 @@ test("anchorErrorStatus maps orchestration error kinds to HTTP statuses", () => 
   assert.equal(anchorErrorStatus({ kind: "not_authenticated", message: "m" }).status, 401);
   assert.equal(anchorErrorStatus({ kind: "profile_not_found", message: "m" }).status, 403);
   assert.equal(anchorErrorStatus({ kind: "not_authorized_to_anchor", message: "m" }).status, 403);
+  assert.equal(anchorErrorStatus({ kind: "case_not_open", message: "m" }).status, 409);
   assert.equal(anchorErrorStatus({ kind: "document_version_not_found", message: "m" }).status, 404);
   assert.equal(anchorErrorStatus({ kind: "evidence_not_found", message: "m" }).status, 404);
   assert.equal(anchorErrorStatus({ kind: "rpc_error", message: "m" }).status, 500);

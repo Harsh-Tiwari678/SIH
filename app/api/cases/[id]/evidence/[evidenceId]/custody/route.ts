@@ -155,6 +155,7 @@ function rpcStatus(message: string): number {
   ) {
     return 404;
   }
+  if (message.includes("case_not_open")) return 409;
   if (message.includes("not_authorized_for_custody")) return 403;
   if (message.includes("verification_required")) return 409;
   return 400;
@@ -165,6 +166,9 @@ function rpcMessage(message: string): string {
   if (message.includes("profile_not_found")) return "Forbidden";
   if (message.includes("evidence_not_found")) return "Evidence not found";
   if (message.includes("case_not_found")) return "Case not found";
+  if (message.includes("case_not_open")) {
+    return "This case is closed or archived; custody events can no longer be recorded";
+  }
   if (message.includes("not_authorized_for_custody")) {
     return "Only the case lead or an investigator can record custody events";
   }

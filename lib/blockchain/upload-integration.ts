@@ -247,6 +247,8 @@ export function anchorErrorStatus(raw: unknown): { status: number; error: string
       case "profile_not_found":
       case "not_authorized_to_anchor":
         return { status: 403, error: raw.message };
+      case "case_not_open":
+        return { status: 409, error: raw.message };
       case "document_version_not_found":
       case "evidence_not_found":
         return { status: 404, error: raw.message };

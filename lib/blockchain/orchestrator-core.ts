@@ -45,6 +45,7 @@ export type AnchorOrchestrationErrorKind =
   | "document_version_not_found"
   | "evidence_not_found"
   | "not_authorized_to_anchor"
+  | "case_not_open"
   | "rpc_error"
   | "invalid_rpc_result"
   | "database_error";

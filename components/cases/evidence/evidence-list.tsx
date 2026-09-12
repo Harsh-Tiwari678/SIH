@@ -91,7 +91,10 @@ export function EvidenceList({
 
       {!caseOpen ? (
         <p className="text-xs text-muted-foreground">
-          This case is closed; evidence cannot be added while it is closed.
+          This case is closed or archived. Adding evidence, changing evidence
+          status, recording custody events and starting new anchors are all
+          disabled until a lead reopens it; existing records remain fully
+          readable.
         </p>
       ) : myRole !== "lead" && myRole !== "investigator" ? (
         <p className="text-xs text-muted-foreground">

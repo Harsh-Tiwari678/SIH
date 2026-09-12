@@ -101,6 +101,14 @@ export async function PATCH(
         );
       case "status_not_allowed":
         return NextResponse.json({ error: "Status not allowed" }, { status: 400 });
+      case "case_not_open":
+        return NextResponse.json(
+          {
+            error:
+              "This case is closed or archived; evidence status can no longer be changed",
+          },
+          { status: 409 },
+        );
       case "verification_required":
         return NextResponse.json(
           {
