@@ -16,9 +16,13 @@ import {
   GET as getOrgAudit,
 } from "../../app/api/organizations/[id]/audit/route.ts";
 import {
+  GET as listOrganizations,
+} from "../../app/api/organizations/route.ts";
+import {
   orgClientHolder,
   makeOrgClient,
   type OrgFakeSupabaseClient,
+  type OrgTableQuery,
 } from "./test-support/org-server-stub.ts";
 
 // ---------------------------------------------------------------------------
@@ -187,6 +191,124 @@ const AUDIT_ROWS = [
     meta: { name: "Alpha Bureau", slug: "alpha-bureau" },
   },
 ];
+
+// =============================================================================
+// ORGANIZATION LIST — GET /api/organizations
+// =============================================================================
+
+describe("GET /api/organizations", () => {
+  it("rejects an unauthenticated session with 401", async () => {
+    const client = makeOrgClient();
+    client.user = null;
+    orgClientHolder.current = client;
+
+    const res = await listOrganizations();
+    assert.equal(res.status, 401);
+    assert.equal((await res.json()).error, "Unauthorized");
+    assert.equal(client.calls.length, 0);
+  });
+
+  it("rejects a caller without an application profile", async () => {
+    const client = makeOrgClient();
+    client.tableHandlers.set("profiles", () => rpcResult(null));
+    orgClientHolder.current = client;
+
+    const res = await listOrganizations();
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).error, "Forbidden");
+  });
+
+  it("returns only the caller's organizations, membership-scoped by RLS", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.tableHandlers.set("organizations", () =>
+      rpcResult([
+        { id: ORG_BETA, name: "Beta Division", slug: "beta-division", created_at: "2026-09-02T08:00:00Z" },
+        { id: ORG_ALPHA, name: "Alpha Bureau", slug: "alpha-bureau", created_at: "2026-09-01T08:00:00Z" },
+      ]),
+    );
+    orgClientHolder.current = client;
+
+    const res = await listOrganizations();
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.organizations.length, 2);
+    assert.deepEqual(Object.keys(body.organizations[0]!), [
+      "id",
+      "name",
+      "slug",
+      "created_at",
+    ]);
+    // newest first, matching the sibling GET /api/cases list
+    assert.equal(body.organizations[0]!.name, "Beta Division");
+  });
+
+  it("projects only list fields and orders by created_at descending", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    const captured: { query: OrgTableQuery | null } = { query: null };
+    client.tableHandlers.set("organizations", (query) => {
+      captured.query = query;
+      return rpcResult([]);
+    });
+    orgClientHolder.current = client;
+
+    await listOrganizations();
+
+    assert.ok(captured.query, "organizations table must be queried");
+    assert.equal(captured.query!.table, "organizations");
+    // field-scoped projection: internal metadata (created_by, updated_at) is
+    // never selected for the public list
+    assert.equal(captured.query!.select, "id, name, slug, created_at");
+    assert.equal(captured.query!.orderColumn, "created_at");
+    assert.equal(captured.query!.ascending, false);
+  });
+
+  it("returns a successful empty list when the caller belongs to no organization", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.tableHandlers.set("organizations", () => rpcResult([]));
+    orgClientHolder.current = client;
+
+    const res = await listOrganizations();
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(body.organizations, []);
+  });
+
+  it("defensively returns an empty list when the DB returns null data", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.tableHandlers.set("organizations", () => rpcResult(null));
+    orgClientHolder.current = client;
+
+    const res = await listOrganizations();
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(body.organizations, []);
+  });
+
+  it("maps a database failure to a safe 500 without echoing internals", async () => {
+    const client = makeOrgClient();
+    installProfile(client);
+    client.tableHandlers.set("organizations", () =>
+      rpcError("connection reset by peer: secret db credentials"),
+    );
+    orgClientHolder.current = client;
+
+    const res = await listOrganizations();
+    const body = await res.json();
+
+    assert.equal(res.status, 500);
+    assert.equal(body.error, "Failed to load organizations");
+    const serialized = JSON.stringify(body);
+    assert.ok(!serialized.includes("connection reset"));
+    assert.ok(!serialized.includes("credentials"));
+  });
+});
 
 // =============================================================================
 // AUTHENTICATION — every route rejects an unauthenticated session with 401

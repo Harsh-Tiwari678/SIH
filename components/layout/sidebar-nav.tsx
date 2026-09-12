@@ -3,7 +3,7 @@
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import type { LucideIcon } from "lucide-react"
-import { FolderOpen, LayoutDashboard } from "lucide-react"
+import { Building2, FolderOpen, LayoutDashboard } from "lucide-react"
 import { cn } from "@/lib/utils"
 import type { ComponentProps } from "react"
 
@@ -21,6 +21,10 @@ const WORKSPACE_ITEM: NavItem = {
 
 const CASE_ITEMS: NavItem[] = [
   { label: "All Cases", href: "/cases", icon: FolderOpen },
+]
+
+const ADMIN_ITEMS: NavItem[] = [
+  { label: "Organizations", href: "/organizations", icon: Building2 },
 ]
 
 function isActive(pathname: string, href: string): boolean {
@@ -87,6 +91,16 @@ function SidebarNav({
       </p>
       <ul className="space-y-0.5">
         {CASE_ITEMS.map((item) => (
+          <li key={item.href}>
+            <SidebarNavLink item={item} onNavigate={onNavigate} />
+          </li>
+        ))}
+      </ul>
+      <p className="mb-1 mt-6 px-2 text-[13px] font-medium text-muted-foreground">
+        Administration
+      </p>
+      <ul className="space-y-0.5">
+        {ADMIN_ITEMS.map((item) => (
           <li key={item.href}>
             <SidebarNavLink item={item} onNavigate={onNavigate} />
           </li>

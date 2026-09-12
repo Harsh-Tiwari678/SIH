@@ -22,6 +22,8 @@ export interface OrgTableQuery {
   select: string;
   eqColumn: string;
   eqValue: unknown;
+  orderColumn: string | null;
+  ascending: boolean | null;
 }
 
 export type OrgTableHandler = (
@@ -31,7 +33,15 @@ export type OrgTableHandler = (
 export interface OrgTableQueryBuilder {
   select(columns: string): OrgTableQueryBuilder;
   eq(column: string, value: unknown): OrgTableQueryBuilder;
+  order(
+    column: string,
+    options?: { ascending?: boolean; nullsFirst?: boolean },
+  ): OrgTableQueryBuilder;
   maybeSingle(): Promise<OrgRpcResult>;
+  then<TResult1 = OrgRpcResult, TResult2 = never>(
+    onfulfilled?: (value: OrgRpcResult) => TResult1 | PromiseLike<TResult1>,
+    onrejected?: (reason: unknown) => TResult2 | PromiseLike<TResult2>,
+  ): Promise<TResult1 | TResult2>;
 }
 
 export interface OrgFakeSupabaseClient {
@@ -93,6 +103,15 @@ export function makeOrgClient(): OrgFakeSupabaseClient {
         select: "*",
         eqColumn: "",
         eqValue: undefined,
+        orderColumn: null,
+        ascending: null,
+      };
+      const run = () => {
+        const handler = client.tableHandlers.get(table);
+        if (!handler) {
+          throw new Error(`unexpected table query: ${table}`);
+        }
+        return handler(query);
       };
       const builder: OrgTableQueryBuilder = {
         select(columns) {
@@ -104,12 +123,16 @@ export function makeOrgClient(): OrgFakeSupabaseClient {
           query.eqValue = value;
           return builder;
         },
+        order(column, options) {
+          query.orderColumn = column;
+          query.ascending = options?.ascending ?? true;
+          return builder;
+        },
         async maybeSingle() {
-          const handler = client.tableHandlers.get(table);
-          if (!handler) {
-            throw new Error(`unexpected table query: ${table}`);
-          }
-          return handler(query);
+          return run();
+        },
+        then(onfulfilled, onrejected) {
+          return Promise.resolve(run()).then(onfulfilled, onrejected);
         },
       };
       return builder;

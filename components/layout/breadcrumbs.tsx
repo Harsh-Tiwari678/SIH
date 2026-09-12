@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils"
 const SEGMENT_LABELS: Record<string, string> = {
   dashboard: "Dashboard",
   cases: "Cases",
+  organizations: "Organizations",
 }
 
 function isUuidLike(value: string): boolean {
@@ -23,9 +24,14 @@ function trailFromPathname(
   const trail: { href: string; label: string }[] = []
   let href = ""
 
-  for (const raw of segments) {
+  for (let i = 0; i < segments.length; i++) {
+    const raw = segments[i]
+    const previous = i > 0 ? segments[i - 1] : undefined
     href += `/${raw}`
-    const label = SEGMENT_LABELS[raw] ?? (isUuidLike(raw) ? "Case" : raw)
+    let label = SEGMENT_LABELS[raw] ?? raw
+    if (isUuidLike(raw)) {
+      label = previous === "organizations" ? "Organization" : "Case"
+    }
     trail.push({
       href,
       label: label.charAt(0).toUpperCase() + label.slice(1),
