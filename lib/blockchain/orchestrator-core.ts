@@ -38,6 +38,10 @@ export type CreateAnchorOutcome =
   | { kind: "already_anchored" };
 
 // Hard (thrown) orchestration failures a caller maps to an HTTP status.
+// "configuration_error" covers server-capability problems: the anchor
+// confirmation secret missing/mismatched with the DB gateway, or the gateway
+// rejecting the transition. It is a deployment/config condition, NOT a
+// distributed-sync window — it must never be masked as db_sync_failed.
 export type AnchorOrchestrationErrorKind =
   | "invalid_request"
   | "not_authenticated"
@@ -48,7 +52,8 @@ export type AnchorOrchestrationErrorKind =
   | "case_not_open"
   | "rpc_error"
   | "invalid_rpc_result"
-  | "database_error";
+  | "database_error"
+  | "configuration_error";
 
 export class AnchorOrchestrationError extends Error {
   readonly kind: AnchorOrchestrationErrorKind;

@@ -255,6 +255,7 @@ export function anchorErrorStatus(raw: unknown): { status: number; error: string
       case "rpc_error":
       case "invalid_rpc_result":
       case "database_error":
+      case "configuration_error":
         return { status: 500, error: raw.message };
     }
   }

@@ -264,15 +264,25 @@ export async function POST(
   });
 
   if (error) {
-    // The object now exists without any database rows. Best-effort orphan
-    // cleanup; a leftover object is harmless, a DB row without its object is
-    // not. Failures are logged, never surfaced as a success.
-    const { error: removeError } = await supabase.storage
-      .from(EVIDENCE_BUCKET)
-      .remove([storageKey]);
-    if (removeError) {
+    // The object now exists without any database rows. Cleanup is delegated to
+    // the server-controlled delete_evidence_object() RPC; the storage API
+    // DELETE path is closed (see
+    // supabase/migrations/20260920000000_harden_storage_delete.sql). Because no
+    // document_versions row was created, that RPC rejects the orphan key by
+    // design, so the object simply remains an immutable leftover. A leftover
+    // object is harmless; a DB row without its object is not. Failures are
+    // logged, never surfaced as a success.
+    const { error: cleanupError } = await supabase.rpc(
+      "delete_evidence_object",
+      { p_storage_key: storageKey },
+    );
+    if (cleanupError) {
       console.error(
-        `Failed to remove orphaned evidence object for case ${caseId}`,
+        JSON.stringify({
+          event: "evidence_orphan_cleanup_rejected",
+          case_id: caseId,
+          bucket: EVIDENCE_BUCKET,
+        }),
       );
     }
     return NextResponse.json(

@@ -6,6 +6,17 @@
 // existing server-only blockchain service (lib/blockchain/anchor.ts) WITHOUT
 // replacing either one.
 //
+// Integrity boundary (audit C1 fix):
+//   The transition RPCs (mark_anchor_anchored / mark_anchor_failed /
+//   reconcile_anchor_anchored) are REVOKED from `authenticated` by
+//   supabase/migrations/20260919000000_block_anchor_state_forgery.sql. This
+//   server is now the ONLY caller that can move anchor state, via the
+//   anchor_state_apply gateway, and even that gateway additionally requires a
+//   confirmation digest only this server can produce (from
+//   ANCHOR_CONFIRMATION_SECRET in .env.local; the DB stores only the SHA-256
+//   digest). auth.uid()-based authorization continues to run inside the RPCs, so
+//   the capability is necessary but never sufficient.
+//
 // Responsibilities:
 //   * authenticate/authorize via the existing server Supabase client (session
 //     cookies + publishable key). It NEVER uses the service-role key and never
@@ -15,12 +26,13 @@
 //   * obtain the authoritative evidence_id / document_version_id /
 //     evidence_sha256 from the RPC result (not from the caller).
 //   * call anchorEvidence() only for a confirmed-pending anchor row.
-//   * mark the row anchored / failed through the RPCs with BOUNDED safe
-//     messages. Never stores raw ethers/provider errors.
+//   * mark the row anchored / failed through the anchor_state_apply gateway
+//     with BOUNDED safe messages. Never stores raw ethers/provider errors.
 //   * tolerate the distributed-sync window (tx confirmed on-chain, DB update
 //     fails): it surfaces a distinct db_sync_failed outcome, leaves the DB
 //     pending, and never sends a second transaction.
 
+import { sha256, toUtf8Bytes } from "ethers";
 import { createClient } from "@/lib/supabase/server";
 import {
   anchorEvidence,
@@ -139,6 +151,20 @@ function markRpcError(operation: string, message: string): AnchorOrchestrationEr
   if (operation === "reconcile_anchor_anchored" && message.includes("hash_mismatch")) {
     return new AnchorOrchestrationError("invalid_rpc_result", "Stored hash does not match the document version hash");
   }
+  // The anchor_state_apply gateway rejected the transition. This is a
+  // server-configuration condition (secret missing/mismatched with the DB
+  // digest, or a state we never send) — it must surface as a 500
+  // configuration_error, never be masked as a distributed-sync window.
+  if (
+    message.includes("invalid_confirmation") ||
+    message.includes("invalid_action") ||
+    message.includes("invalid_anchor_params")
+  ) {
+    return new AnchorOrchestrationError(
+      "configuration_error",
+      "The anchor confirmation gate rejected this transition — the server secret may not match the database expectation",
+    );
+  }
   return new AnchorOrchestrationError("database_error", `${operation} failed`);
 }
 
@@ -164,6 +190,43 @@ function logSafe(level: "info" | "warn" | "error", event: string, fields: {
 
 function safeChainErrorFrom(category: AnchorErrorCategory): string {
   return ERROR_CATEGORY_MESSAGES[category];
+}
+
+// ---------------------------------------------------------------------------
+// Anchor state capability gate (server-only)
+// ---------------------------------------------------------------------------
+
+const CONFIRMATION_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * Produce the confirmation digest required by public.anchor_state_apply (SQL
+ * in supabase/migrations/20260919000000_block_anchor_state_forgery.sql). The
+ * state-mutating RPCs are revoked from `authenticated`, and this digest is the
+ * ONLY thing that can pass the gateway — only server code holding
+ * ANCHOR_CONFIRMATION_SECRET (in .env.local) can compute it. The database and
+ * the wire carry only the digest, never the secret.
+ *
+ * Throws configuration_error when the secret is absent or unusable, so a
+ * misconfigured deployment fails loudly as a 500 instead of surfacing a
+ * confusing invalid_confirmation later.
+ */
+function confirmationToken(): string {
+  const secret = process.env.ANCHOR_CONFIRMATION_SECRET;
+  if (!secret) {
+    throw new AnchorOrchestrationError(
+      "configuration_error",
+      "ANCHOR_CONFIRMATION_SECRET is not configured on the server",
+    );
+  }
+  const digest = sha256(toUtf8Bytes(secret)).toLowerCase();
+  const hex = digest.startsWith("0x") ? digest.slice(2) : digest;
+  if (!CONFIRMATION_DIGEST_PATTERN.test(hex)) {
+    throw new AnchorOrchestrationError(
+      "configuration_error",
+      "ANCHOR_CONFIRMATION_SECRET did not produce a valid confirmation digest",
+    );
+  }
+  return hex;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,14 +379,19 @@ export async function anchorDocumentVersion(
   // Step 4 — record the confirmed anchor in the DB from the AUTHORITATIVE
   // receipt. The pre-broadcast read already proved the slot absent, so the
   // confirmed receipt is sufficient; no post-broadcast re-read is needed.
+  // The transition goes through the anchor_state_apply gateway (the raw
+  // mark_anchor_anchored RPC is revoked from `authenticated`).
   try {
     const { data: markData, error: markError } = await supabase.rpc(
-      "mark_anchor_anchored",
+      "anchor_state_apply",
       {
+        p_action: "anchored",
         p_anchor_id: anchorId,
         p_tx_hash: confirmation.txHash,
         p_block_number: Number(confirmation.blockNumber),
         p_anchored_at: blockTimestampToIso(confirmation.anchoredAt),
+        p_error_message: null,
+        p_confirmation_token: confirmationToken(),
       },
     );
     if (markError) {
@@ -431,10 +499,14 @@ async function reconcileOutcome(
   }
 
   try {
-    const { data, error } = await supabase.rpc("reconcile_anchor_anchored", {
+    const { data, error } = await supabase.rpc("anchor_state_apply", {
+      p_action: "reconcile",
       p_anchor_id: params.p_anchor_id,
+      p_tx_hash: null,
       p_block_number: Number(params.p_block_number),
       p_anchored_at: params.p_anchored_at,
+      p_error_message: null,
+      p_confirmation_token: confirmationToken(),
     });
     if (error) {
       throw markRpcError("reconcile_anchor_anchored", error.message);
@@ -482,9 +554,14 @@ async function markFailedBestEffort(
   anchorId: string,
   safeMessage: string,
 ): Promise<void> {
-  const { error } = await supabase.rpc("mark_anchor_failed", {
+  const { error } = await supabase.rpc("anchor_state_apply", {
+    p_action: "failed",
     p_anchor_id: anchorId,
+    p_tx_hash: null,
+    p_block_number: null,
+    p_anchored_at: null,
     p_error_message: safeMessage,
+    p_confirmation_token: confirmationToken(),
   });
   if (error) {
     const mapped = markRpcError("mark_anchor_failed", error.message);

@@ -7,9 +7,11 @@
 --     core table and INSERT/UPDATE/DELETE on all tables; only the RPC/SELECT
 --     paths remain.
 --   PART 2 — COLUMN-LEVEL UPDATE NARROWED. Only the documented safe columns
---     stay updatable: cases(title,description,status,closed_at,closed_by,
---     updated_at), evidence(title,description,type,updated_at), profiles(
---     full_name,badge_number,updated_at), organizations(name,slug,updated_at).
+--     stay updatable: cases(title,description,updated_at), evidence(title,
+--     description,type,updated_at), profiles(full_name,badge_number,updated_at),
+--     organizations(name,slug,updated_at). cases.status/closed_at/closed_by are
+--     revoked by 20260918000000 (case-close immutability): lifecycle state is
+--     changed ONLY through the update_case SECURITY DEFINER RPC.
 --     document_versions / audit_logs / blockchain_anchors / case_members /
 --     organization_members / chain_of_custody have ZERO column UPDATE.
 --   PARTS 3-6 — WRITE RCPS ORG-AWARE. update_case, update_evidence_status,
@@ -24,7 +26,7 @@
 -- Test inventory (T21..T30; continues after the org_case_security T1..T20):
 --   T21  TRUNCATE revoked on all 10 tables
 --   T22  INSERT / DELETE revoked; SELECT / REFERENCES / TRIGGER retained
---   T23  column-level UPDATE narrowed to the safe set
+--   T23  column-level UPDATE narrowed to the safe set (case lifecycle: RPC-only)
 --   T24  direct DML attempts: evidence.status denied, cases provenance denied,
 --        audit_logs INSERT denied, TRUNCATE denied; cases.title direct edit
 --        still allowed for the lead (positive control)
@@ -233,8 +235,14 @@ begin
 end $$;
 
 -- =============================================================================
--- T23 — column-level UPDATE narrowed to the documented safe set
+-- T23 — column-level UPDATE narrowed to the safe set (case lifecycle: RPC-only)
 -- =============================================================================
+-- 20260917 defines the direct-UPDATE safe sets; 20260918000000 (case-close
+-- immutability) subsequently revokes cases.status / closed_at / closed_by so the
+-- lifecycle is changed ONLY through the hardened update_case SECURITY DEFINER
+-- RPC (transitions + closed_at/closed_by are server-derived). T23 asserts the
+-- CURRENT intended surface: metadata/display columns stay directly updateable,
+-- provenance/identity columns stay revoked, and lifecycle columns stay revoked.
 do $$
 begin
     -- cases: provenance/identity columns are NOT updatable...
@@ -246,22 +254,33 @@ begin
     then
         raise exception 'FAIL T23: cases provenance columns are updatable';
     end if;
+    -- ...the case-close lifecycle columns are server-controlled (REVOKED)...
+    if has_column_privilege('authenticated', 'public.cases', 'status', 'UPDATE')
+       or has_column_privilege('authenticated', 'public.cases', 'closed_at', 'UPDATE')
+       or has_column_privilege('authenticated', 'public.cases', 'closed_by', 'UPDATE')
+    then
+        raise exception 'FAIL T23: cases lifecycle columns are updatable by clients';
+    end if;
     -- ...while the legit metadata set stays updatable.
     if not has_column_privilege('authenticated', 'public.cases', 'title', 'UPDATE')
-       or not has_column_privilege('authenticated', 'public.cases', 'status', 'UPDATE')
+       or not has_column_privilege('authenticated', 'public.cases', 'description', 'UPDATE')
        or not has_column_privilege('authenticated', 'public.cases', 'updated_at', 'UPDATE')
-       or has_column_privilege('authenticated', 'public.cases', 'id', 'UPDATE')
     then
         raise exception 'FAIL T23: cases safe columns no longer updatable';
     end if;
 
-    -- evidence: status is NOT updatable directly; metadata columns are.
+    -- evidence: status is NOT updatable directly (verified/anchor-gated RPCs
+    -- only); provenance/identity revoked; metadata columns stay updatable.
     if has_column_privilege('authenticated', 'public.evidence', 'status', 'UPDATE')
        or has_column_privilege('authenticated', 'public.evidence', 'id', 'UPDATE')
        or has_column_privilege('authenticated', 'public.evidence', 'case_id', 'UPDATE')
        or has_column_privilege('authenticated', 'public.evidence', 'evidence_number', 'UPDATE')
+       or has_column_privilege('authenticated', 'public.evidence', 'created_by', 'UPDATE')
+       or has_column_privilege('authenticated', 'public.evidence', 'created_at', 'UPDATE')
+       or not has_column_privilege('authenticated', 'public.evidence', 'title', 'UPDATE')
        or not has_column_privilege('authenticated', 'public.evidence', 'description', 'UPDATE')
        or not has_column_privilege('authenticated', 'public.evidence', 'type', 'UPDATE')
+       or not has_column_privilege('authenticated', 'public.evidence', 'updated_at', 'UPDATE')
     then
         raise exception 'FAIL T23: evidence column grants wrong';
     end if;
@@ -277,10 +296,18 @@ begin
     end if;
 
     -- organizations/profiles: safe set only.
-    if has_column_privilege('authenticated', 'public.organizations', 'created_by', 'UPDATE')
+    if has_column_privilege('authenticated', 'public.organizations', 'id', 'UPDATE')
+       or has_column_privilege('authenticated', 'public.organizations', 'created_by', 'UPDATE')
+       or has_column_privilege('authenticated', 'public.organizations', 'created_at', 'UPDATE')
        or not has_column_privilege('authenticated', 'public.organizations', 'name', 'UPDATE')
+       or not has_column_privilege('authenticated', 'public.organizations', 'slug', 'UPDATE')
+       or not has_column_privilege('authenticated', 'public.organizations', 'updated_at', 'UPDATE')
+       or has_column_privilege('authenticated', 'public.profiles', 'id', 'UPDATE')
        or has_column_privilege('authenticated', 'public.profiles', 'role', 'UPDATE')
+       or has_column_privilege('authenticated', 'public.profiles', 'created_at', 'UPDATE')
        or not has_column_privilege('authenticated', 'public.profiles', 'full_name', 'UPDATE')
+       or not has_column_privilege('authenticated', 'public.profiles', 'badge_number', 'UPDATE')
+       or not has_column_privilege('authenticated', 'public.profiles', 'updated_at', 'UPDATE')
     then
         raise exception 'FAIL T23: organizations/profiles column grants wrong';
     end if;

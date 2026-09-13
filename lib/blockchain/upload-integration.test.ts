@@ -286,6 +286,7 @@ test("anchorErrorStatus maps orchestration error kinds to HTTP statuses", () => 
   assert.equal(anchorErrorStatus({ kind: "rpc_error", message: "m" }).status, 500);
   assert.equal(anchorErrorStatus({ kind: "invalid_rpc_result", message: "m" }).status, 500);
   assert.equal(anchorErrorStatus({ kind: "database_error", message: "m" }).status, 500);
+  assert.equal(anchorErrorStatus({ kind: "configuration_error", message: "m" }).status, 500);
 });
 
 test("[7] authorization failures surface as 4xx, never as an anchor success", () => {

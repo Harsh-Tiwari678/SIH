@@ -10,10 +10,19 @@
 // create a second on-chain transaction, and a transaction hash is never
 // fabricated.
 //
+// The DB state-mutating RPCs (mark_anchor_anchored / mark_anchor_failed /
+// reconcile_anchor_anchored) are revoked from `authenticated` by migration
+// 20260919000000 — all transitions must flow through the anchor_state_apply
+// gateway and carry the server-derived confirmation digest. The scenarios below
+// pin that server surface: the raw RPC names must never appear in the client's
+// calls, and a missing/mismatched secret must surface as configuration_error,
+// never as a masked db_sync_failed.
+//
 // Run via: npm test  (package.json wires the loader + module-mock flags).
 
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { BlockchainAnchorError, ERROR_CATEGORY_MESSAGES } from "./errors.ts";
 import { AnchorOrchestrationError } from "./orchestrator-core.ts";
 import {
@@ -38,6 +47,17 @@ const ISO_ANCHORED_AT = "2023-11-14T22:13:20.000Z";
 
 const BLOCK_NUMBER = 19_000_000n;
 const ANCHORED_AT = 1_700_000_000n;
+
+// Confirmation capability (audit C1 fix). The orchestrator derives the token
+// from a server-only secret (ANCHOR_CONFIRMATION_SECRET); the DB gateway only
+// stores/compares the SHA-256 digest. Node does not load .env.local, so the
+// test sets the secret explicitly and asserts the exact digest the server
+// sends. The raw secret must never appear in the RPC params itself.
+const CONFIRMATION_SECRET = "orchestrator-test-anchor-confirmation-secret";
+process.env.ANCHOR_CONFIRMATION_SECRET = CONFIRMATION_SECRET;
+const CONFIRMATION_DIGEST = createHash("sha256")
+  .update(CONFIRMATION_SECRET)
+  .digest("hex");
 
 function pendingCreated(reused = false) {
   return {
@@ -137,12 +157,34 @@ async function expectRejectedKind(
   assert.equal((caught as AnchorOrchestrationError).kind, kind);
 }
 
+// Every anchor transition must flow through the anchor_state_apply gateway (the
+// raw mark_*/reconcile RPCs are revoked from `authenticated`) and must carry
+// the server-derived confirmation digest.
+function assertAnchorStatesGated(client: FakeSupabaseClient): void {
+  for (const call of client.calls.filter((c) => c.fn === "anchor_state_apply")) {
+    assert.equal(
+      call.params.p_confirmation_token,
+      CONFIRMATION_DIGEST,
+      "anchor_state_apply must carry the server-derived confirmation digest",
+    );
+  }
+}
+
+function anchorApplyWithAction(
+  client: FakeSupabaseClient,
+  action: string,
+): Array<{ fn: string; params: Record<string, unknown> }> {
+  return client.calls.filter(
+    (c) => c.fn === "anchor_state_apply" && c.params.p_action === action,
+  );
+}
+
 // ---- scenarios -------------------------------------------------------------
 
 test("[1] pending + matching chain anchor -> reconciled (never broadcast)", async () => {
-  setup({
+  const client = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    reconcile_anchor_anchored: () => ({ data: { transitioned: true }, error: null }),
+    anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
   });
   anchorEvidenceImpl = () => neverCalled("anchorEvidence");
   getOnChainImpl = async () => matchedOnChain;
@@ -157,12 +199,14 @@ test("[1] pending + matching chain anchor -> reconciled (never broadcast)", asyn
   });
   assert.equal(anchorEvidenceCalls, 0);
   assert.equal(getOnChainCalls, 1);
+  assertAnchorStatesGated(client);
+  assert.equal(anchorApplyWithAction(client, "reconcile").length, 1);
 });
 
 test("[2] the reconciled path performs ZERO broadcast calls", async () => {
   const client = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    reconcile_anchor_anchored: () => ({ data: { transitioned: true }, error: null }),
+    anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
   });
   anchorEvidenceImpl = () => neverCalled("anchorEvidence");
   getOnChainImpl = async () => matchedOnChain;
@@ -171,18 +215,19 @@ test("[2] the reconciled path performs ZERO broadcast calls", async () => {
 
   assert.equal(outcome.status, "reconciled");
   assert.equal(anchorEvidenceCalls, 0);
-  // The only RPCs the DB boundary ever sees are create + reconcile.
+  // The only RPCs the DB boundary ever sees are create + the gateway.
   const mutators = client.calls.filter((c) => c.fn !== "create_blockchain_anchor");
   assert.deepEqual(
     mutators.map((c) => c.fn),
-    ["reconcile_anchor_anchored"],
+    ["anchor_state_apply"],
   );
+  assertAnchorStatesGated(client);
 });
 
 test("[10] reconciliation never fabricates a transaction hash", async () => {
   const client = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    reconcile_anchor_anchored: () => ({ data: { transitioned: true }, error: null }),
+    anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
   });
   anchorEvidenceImpl = async () => confirmation;
   getOnChainImpl = async () => matchedOnChain;
@@ -191,13 +236,24 @@ test("[10] reconciliation never fabricates a transaction hash", async () => {
 
   assert.equal(outcome.status, "reconciled");
   assert.equal("txHash" in outcome, false);
-  const reconcile = client.calls.find((c) => c.fn === "reconcile_anchor_anchored");
+  const [reconcile] = anchorApplyWithAction(client, "reconcile");
   assert.ok(reconcile);
-  assert.equal("p_tx_hash" in reconcile.params, false);
+  // The gateway receives p_tx_hash explicitly NULL — a hash is never fabricated,
+  // in the params or anywhere else.
+  assert.equal(reconcile.params.p_tx_hash, null);
   assert.deepEqual(
     Object.keys(reconcile.params).sort(),
-    ["p_anchor_id", "p_anchored_at", "p_block_number"],
+    [
+      "p_action",
+      "p_anchor_id",
+      "p_anchored_at",
+      "p_block_number",
+      "p_confirmation_token",
+      "p_error_message",
+      "p_tx_hash",
+    ],
   );
+  assert.equal(reconcile.params.p_confirmation_token, CONFIRMATION_DIGEST);
   // anchorEvidence must not even be invokable in this path: the broadcast
   // stub would have returned a hash, and it must never be read.
   assert.equal(anchorEvidenceCalls, 0);
@@ -206,7 +262,7 @@ test("[10] reconciliation never fabricates a transaction hash", async () => {
 test("[3] pending + absent chain -> exactly one broadcast, then anchored", async () => {
   const client = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    mark_anchor_anchored: () => ({ data: { transitioned: true }, error: null }),
+    anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
   });
   anchorEvidenceImpl = async () => confirmation;
   getOnChainImpl = async () => absentOnChain;
@@ -221,15 +277,22 @@ test("[3] pending + absent chain -> exactly one broadcast, then anchored", async
     anchoredAt: ISO_ANCHORED_AT,
   });
   assert.equal(anchorEvidenceCalls, 1);
-  const mark = client.calls.find((c) => c.fn === "mark_anchor_anchored");
+  const [mark] = anchorApplyWithAction(client, "anchored");
   assert.ok(mark);
   assert.equal(mark.params.p_tx_hash, TX_HASH);
+  assert.equal(mark.params.p_confirmation_token, CONFIRMATION_DIGEST);
+  assert.ok(
+    client.calls.every(
+      (c) => c.fn !== "mark_anchor_anchored" && c.fn !== "mark_anchor_failed" && c.fn !== "reconcile_anchor_anchored",
+    ),
+    "the raw state-mutating RPCs must never be called by the orchestrator",
+  );
 });
 
 test("[4] pending + mismatched chain -> verification_failed, never reconciled, no broadcast", async () => {
   const client = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    mark_anchor_failed: () => ({ data: { transitioned: true }, error: null }),
+    anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
   });
   anchorEvidenceImpl = () => neverCalled("anchorEvidence");
   getOnChainImpl = async () => ({ ...matchedOnChain, storedSha256: OTHER_HASH });
@@ -238,8 +301,9 @@ test("[4] pending + mismatched chain -> verification_failed, never reconciled, n
 
   assert.equal(outcome.status, "verification_failed");
   assert.equal(anchorEvidenceCalls, 0);
-  assert.equal(client.calls.some((c) => c.fn === "reconcile_anchor_anchored"), false);
-  assert.equal(client.calls.some((c) => c.fn === "mark_anchor_anchored"), false);
+  assert.equal(anchorApplyWithAction(client, "reconcile").length, 0);
+  assert.equal(anchorApplyWithAction(client, "anchored").length, 0);
+  assertAnchorStatesGated(client);
 });
 
 test("[5] pending + chain READ failure -> verification_ambiguous, row untouched, no broadcast", async () => {
@@ -273,7 +337,7 @@ test("[6] original tx succeeded + DB sync failed -> later retry reconciles with 
   // row pending (it must NOT mark it failed).
   const c1 = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    mark_anchor_anchored: () => ({
+    anchor_state_apply: () => ({
       data: null,
       error: { message: "database connection lost" },
     }),
@@ -284,14 +348,15 @@ test("[6] original tx succeeded + DB sync failed -> later retry reconciles with 
   const first = await anchorDocumentVersion(VERSION_UUID);
   assert.equal(first.status, "db_sync_failed");
   assert.equal(anchorEvidenceCalls, 1);
-  assert.equal(c1.calls.some((c) => c.fn === "mark_anchor_failed"), false);
+  assert.equal(anchorApplyWithAction(c1, "failed").length, 0);
+  assertAnchorStatesGated(c1);
 
   // Attempt 2 (the retry): DB row is STILL pending; the chain now holds our
   // anchor. The only correct action is reconciliation — never a second
   // broadcast.
   const c2 = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(true), error: null }),
-    reconcile_anchor_anchored: () => ({ data: { transitioned: true }, error: null }),
+    anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
   });
   getOnChainImpl = async () => matchedOnChain;
 
@@ -305,7 +370,8 @@ test("[6] original tx succeeded + DB sync failed -> later retry reconciles with 
   // The CORE invariant: across both attempts, the chain saw exactly ONE
   // transaction.
   assert.equal(totalAnchorEvidenceCalls, broadcastsBefore + 1);
-  assert.equal(c2.calls.some((c) => c.fn === "mark_anchor_anchored"), false);
+  assert.equal(anchorApplyWithAction(c2, "anchored").length, 0);
+  assertAnchorStatesGated(c2);
 });
 
 test("[7] a retry after reconciliation is terminal and never broadcasts again", async () => {
@@ -332,7 +398,7 @@ test("[7] a retry after reconciliation is terminal and never broadcasts again", 
 test("[8] a failed row's retry reuses the pending slot and broadcasts once", async () => {
   setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(true), error: null }),
-    mark_anchor_anchored: () => ({ data: { transitioned: true }, error: null }),
+    anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
   });
   anchorEvidenceImpl = async () => confirmation;
   getOnChainImpl = async () => absentOnChain;
@@ -372,7 +438,7 @@ test("[race] a conflicting broadcast is reconciled from the re-read, never rebro
   // and reconcile the pending row — WITHOUT retrying the broadcast.
   const client = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    reconcile_anchor_anchored: () => ({ data: { transitioned: true }, error: null }),
+    anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
   });
   const reads = [absentOnChain, matchedOnChain];
   getOnChainImpl = async () => reads.shift() ?? neverCalled("getOnChainAnchor");
@@ -387,7 +453,8 @@ test("[race] a conflicting broadcast is reconciled from the re-read, never rebro
   // One broadcast attempt (reverted by the contract); never a second one.
   assert.equal(anchorEvidenceCalls, 1);
   assert.equal(getOnChainCalls, 2);
-  assert.ok(client.calls.some((c) => c.fn === "reconcile_anchor_anchored"));
+  assert.equal(anchorApplyWithAction(client, "reconcile").length, 1);
+  assertAnchorStatesGated(client);
 });
 
 test("[12] unauthorized role is rejected at create and never reaches the chain", async () => {
@@ -416,7 +483,7 @@ test("[11] cross-case authorization failure at reconcile surfaces as an error, n
   // (-> 403), NOT be swallowed into a db_sync_failed 202.
   const client = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    reconcile_anchor_anchored: () => ({
+    anchor_state_apply: () => ({
       data: null,
       error: { message: "not_authorized_to_anchor: actor not on this evidence's case" },
     }),
@@ -429,13 +496,13 @@ test("[11] cross-case authorization failure at reconcile surfaces as an error, n
   );
 
   assert.equal(anchorEvidenceCalls, 0);
-  assert.equal(client.calls.some((c) => c.fn === "mark_anchor_anchored"), false);
+  assert.equal(anchorApplyWithAction(client, "anchored").length, 0);
 });
 
 test("a mark_anchor_anchored authorization rejection is not masked as db_sync_failed", async () => {
   const client = setup({
     create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
-    mark_anchor_anchored: () => ({
+    anchor_state_apply: () => ({
       data: null,
       error: { message: "not_authenticated: session expired" },
     }),
@@ -450,5 +517,49 @@ test("a mark_anchor_anchored authorization rejection is not masked as db_sync_fa
   assert.equal(anchorEvidenceCalls, 1);
   // The on-chain fact is safe: a later retry (fresh session) will read the
   // chain, see the match, and reconcile — so the row must still be pending.
-  assert.equal(client.calls.some((c) => c.fn === "mark_anchor_failed"), false);
+  assert.equal(anchorApplyWithAction(client, "failed").length, 0);
+});
+
+test("missing ANCHOR_CONFIRMATION_SECRET surfaces as configuration_error, never a masked db_sync_failed", async () => {
+  const secret = process.env.ANCHOR_CONFIRMATION_SECRET;
+  delete process.env.ANCHOR_CONFIRMATION_SECRET;
+  try {
+    const client = setup({
+      create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
+      anchor_state_apply: () => ({ data: { transitioned: true }, error: null }),
+    });
+    anchorEvidenceImpl = async () => confirmation;
+    getOnChainImpl = async () => absentOnChain;
+
+    await expectRejectedKind("configuration_error", () =>
+      anchorDocumentVersion(VERSION_UUID),
+    );
+    // The broadcast happened but the DB transition never ran — a later retry
+    // (with the secret restored) will read the chain and reconcile it. The
+    // failure must NOT be swallowed into a db_sync_failed 202.
+    assert.equal(anchorEvidenceCalls, 1);
+    assert.equal(anchorApplyWithAction(client, "anchored").length, 0);
+  } finally {
+    process.env.ANCHOR_CONFIRMATION_SECRET = secret;
+  }
+});
+
+test("a gateway invalid_confirmation rejection surfaces as configuration_error, not a sync window", async () => {
+  const client = setup({
+    create_blockchain_anchor: () => ({ data: pendingCreated(), error: null }),
+    anchor_state_apply: () => ({
+      data: null,
+      error: { message: "invalid_confirmation" },
+    }),
+  });
+  anchorEvidenceImpl = async () => confirmation;
+  getOnChainImpl = async () => absentOnChain;
+
+  await expectRejectedKind("configuration_error", () =>
+    anchorDocumentVersion(VERSION_UUID),
+  );
+  assert.equal(anchorEvidenceCalls, 1);
+  const [mark] = anchorApplyWithAction(client, "anchored");
+  assert.ok(mark);
+  assert.equal(mark.params.p_confirmation_token, CONFIRMATION_DIGEST);
 });
