@@ -82,6 +82,16 @@
 -- ---------------------------------------------------------------------------
 -- Fixtures (run as postgres / owner; RLS is bypassed for the fixture writer)
 -- ---------------------------------------------------------------------------
+-- p_confirmation_token MUST be the raw HASH_CONFIRMATION_SECRET (the L3.1
+-- capability gate, migration 20260925000000, hashes the supplied token inside
+-- the DB and compares the computed digest to its verifier).  The T22
+-- create_evidence() call carries the raw secret to satisfy the gate.  The raw
+-- secret lives only in .env.local and is read at runtime from the
+-- HASH_CONFIRMATION_SECRET environment variable into a session GUC
+-- (current_setting call site below) — never embedded in this tracked file.
+-- Run suites with HASH_CONFIRMATION_SECRET=<secret> psql ... -f <suite.sql>.
+\getenv hash_token HASH_CONFIRMATION_SECRET
+set app.capability_token = :'hash_token';
 
 insert into auth.users (id, email, encrypted_password, email_confirmed_at, raw_app_meta_data, created_at, updated_at)
 values
@@ -139,6 +149,17 @@ insert into public.document_versions (id, evidence_id, version, prev_version_id,
 values
   ('75000000-0000-0000-0000-0000000000A1', '74000000-0000-0000-0000-0000000000A1', 1, null, 'alpha.pdf', 'application/pdf', 10, repeat('a', 64), '73000000-0000-0000-0000-0000000000A1/74000000-0000-0000-0000-0000000000A1/75000000-0000-0000-0000-0000000000A1', '71000000-0000-0000-0000-000000000002', null),
   ('75000000-0000-0000-0000-0000000000B1', '74000000-0000-0000-0000-0000000000B1', 1, null, 'beta.pdf',  'application/pdf', 20, repeat('b', 64), '73000000-0000-0000-0000-0000000000B1/74000000-0000-0000-0000-0000000000B1/75000000-0000-0000-0000-0000000000B1', '71000000-0000-0000-0000-000000000006', null);
+
+-- the storage.objects fixture for T22's intake create (L3: create_evidence
+-- now requires a real object of the declared size at the opaque key).
+insert into storage.objects (bucket_id, name, owner, metadata, created_at, updated_at)
+values (
+  'evidence-files',
+  '73000000-0000-0000-0000-0000000000a1/74000000-0000-0000-0000-0000000000c1/75000000-0000-0000-0000-0000000000c1',
+  '71000000-0000-0000-0000-000000000002',
+  '{"size":30,"mimetype":"application/pdf"}',
+  now(), now()
+);
 
 insert into public.chain_of_custody (id, evidence_id, document_version_id, action, actor_id, from_profile_id, to_profile_id, notes)
 values
@@ -761,7 +782,8 @@ begin
         p_file_size_bytes       => 30,
         p_sha256                => repeat('c', 64),
         p_storage_key           => '73000000-0000-0000-0000-0000000000a1/74000000-0000-0000-0000-0000000000c1/75000000-0000-0000-0000-0000000000c1',
-        p_notes                 => null
+        p_notes                 => null,
+        p_confirmation_token    => current_setting('app.capability_token', true)
     );
 
     select count(*) into n

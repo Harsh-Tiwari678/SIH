@@ -14,6 +14,7 @@ import {
   persistedVersionIdFromResponse,
   requestPendingAnchor,
 } from "@/lib/blockchain/upload-integration";
+import { evidenceRegistrationToken } from "@/lib/evidence-registration";
 import {
   serializeEvidenceListItem,
   type EvidenceListRawRow,
@@ -261,6 +262,7 @@ export async function POST(
     p_sha256: sha256,
     p_storage_key: storageKey,
     p_notes: notes ?? null,
+    p_confirmation_token: await evidenceRegistrationToken(),
   });
 
   if (error) {
@@ -347,6 +349,8 @@ function rpcStatus(message: string): number {
   if (message.includes("evidence_type_not_allowed")) return 400;
   if (message.includes("invalid_file_metadata")) return 400;
   if (message.includes("storage_key_mismatch")) return 400;
+  if (message.includes("storage_object_not_found")) return 404;
+  if (message.includes("invalid_confirmation")) return 500;
   return 500;
 }
 
@@ -366,6 +370,12 @@ function rpcMessage(message: string): string {
   if (message.includes("invalid_file_metadata")) return "Invalid file metadata";
   if (message.includes("storage_key_mismatch")) {
     return "Storage key does not match the evidence identifiers";
+  }
+  if (message.includes("storage_object_not_found")) {
+    return "The uploaded file could not be verified in secure storage";
+  }
+  if (message.includes("invalid_confirmation")) {
+    return "Evidence hash registration configuration error";
   }
   return "Failed to create evidence";
 }

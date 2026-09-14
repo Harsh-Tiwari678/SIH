@@ -21,7 +21,8 @@
 --     lead membership still cannot write.
 --   PARTS 7-9 — READ RCPS. list_organization_members,
 --     list_organization_audit_events, lookup_profiles_for_organization exist,
---     are org-scoped, and leak nothing across organizations.
+--     are org-scoped, leak nothing across organizations, and (since
+--     20260921000000) require role_in_org = 'admin' in the target org.
 --
 -- Test inventory (T21..T30; continues after the org_case_security T1..T20):
 --   T21  TRUNCATE revoked on all 10 tables
@@ -35,8 +36,9 @@
 --   T26  org admin WITHOUT explicit lead membership cannot write (any RPC)
 --   T27  valid lead/investigator still works (update_case / evidence status /
 --        create_evidence / create_blockchain_anchor positive controls)
---   T28  list_organization_members: org-scoped, member-roster correct,
---        cross-org denied (org_not_found), anon denied
+--   T28  list_organization_members: admin-only roster, admin-roster correct,
+--        cross-org denied (org_not_found), own-org denied for non-admins,
+--        anon denied
 --   T29  list_organization_audit_events: complete org trail (org + case +
 --        evidence + member events), meta scrubbed of storage_key, cross-org
 --        denied, anon denied
@@ -79,6 +81,17 @@
 -- ---------------------------------------------------------------------------
 -- Fixtures (run as postgres / owner; RLS is bypassed for the fixture writer)
 -- ---------------------------------------------------------------------------
+-- p_confirmation_token MUST be the raw HASH_CONFIRMATION_SECRET (the L3.1
+-- capability gate, migration 20260925000000, hashes the supplied token inside
+-- the DB and compares the computed digest to its verifier).  create_evidence()
+-- calls that must reach their target check (authz, storage) carry the raw
+-- secret so the gate is satisfied first.  The raw secret lives only in
+-- .env.local and is read at runtime from the HASH_CONFIRMATION_SECRET
+-- environment variable into a session GUC (current_setting call sites below) —
+-- never embedded in this tracked file.
+-- Run suites with HASH_CONFIRMATION_SECRET=<secret> psql ... -f <suite.sql>.
+\getenv hash_token HASH_CONFIRMATION_SECRET
+set app.capability_token = :'hash_token';
 
 insert into auth.users (id, email, encrypted_password, email_confirmed_at, raw_app_meta_data, created_at, updated_at)
 values
@@ -161,6 +174,17 @@ values
 insert into public.document_versions (id, evidence_id, version, prev_version_id, file_name, mime_type, file_size_bytes, sha256, storage_key, uploaded_by, notes)
 values
   ('85000000-0000-0000-0000-0000000000A1', '84000000-0000-0000-0000-0000000000A1', 1, null, 'om.pdf', 'application/pdf', 1234, repeat('a', 64), '83000000-0000-0000-0000-0000000000A1/84000000-0000-0000-0000-0000000000A1/85000000-0000-0000-0000-0000000000A1', '81000000-0000-0000-0000-000000000003', null);
+
+-- the storage.objects fixture for T27's intake create (L3: create_evidence
+-- now requires a real object of the declared size at the opaque key).
+insert into storage.objects (bucket_id, name, owner, metadata, created_at, updated_at)
+values (
+  'evidence-files',
+  '83000000-0000-0000-0000-0000000000a1/84000000-0000-0000-0000-0000000000a2/85000000-0000-0000-0000-0000000000a2',
+  '81000000-0000-0000-0000-000000000002',
+  '{"size":2048,"mimetype":"application/pdf"}',
+  now(), now()
+);
 
 -- Audit fixture rows. The 'case'/'evidence' rows intentionally leave the
 -- org_id COLUMN null — mirroring the real writers (which store org only in
@@ -474,7 +498,8 @@ begin
             p_file_size_bytes      => 10,
             p_sha256               => repeat('d', 64),
             p_storage_key          => '83000000-0000-0000-0000-0000000000a1/84000000-0000-0000-0000-0000000000a3/85000000-0000-0000-0000-0000000000a3',
-            p_notes                => null
+            p_notes                => null,
+            p_confirmation_token   => current_setting('app.capability_token', true)
         );
         raise exception 'FAIL T25: stale member created evidence';
     exception when others then
@@ -541,7 +566,8 @@ begin
             p_file_size_bytes      => 10,
             p_sha256               => repeat('e', 64),
             p_storage_key          => '83000000-0000-0000-0000-0000000000a1/84000000-0000-0000-0000-0000000000a4/85000000-0000-0000-0000-0000000000a4',
-            p_notes                => null
+            p_notes                => null,
+            p_confirmation_token   => current_setting('app.capability_token', true)
         );
         raise exception 'FAIL T26: org admin uploaded evidence without explicit case role';
     exception when others then
@@ -629,7 +655,8 @@ begin
         p_file_size_bytes      => 2048,
         p_sha256               => repeat('b', 64),
         p_storage_key          => '83000000-0000-0000-0000-0000000000a1/84000000-0000-0000-0000-0000000000a2/85000000-0000-0000-0000-0000000000a2',
-        p_notes                => null
+        p_notes                => null,
+        p_confirmation_token   => current_setting('app.capability_token', true)
     );
 
     -- the intake custody 'received' row must exist (T22 regression stays green)
@@ -691,11 +718,24 @@ begin
         end if;
     end;
 
-    -- ...but their own org's roster is visible (member-scoped read). u5/u8
-    -- are the org-beta members (u8 added as the T30 candidate fixture).
-    if (select count(*) from public.list_organization_members('82000000-0000-0000-0000-0000000000B1')) <> 2 then
-        raise exception 'FAIL T28: member cannot list their own org';
-    end if;
+    -- They cannot list even their OWN org's members unless they administer
+    -- that org (20260921000000 M1 hardening: roster reads are admin-only).
+    -- u5 is org-beta 'member'; the org-less call is reported as org_not_found.
+    declare
+        v_allowed boolean := false;
+    begin
+        begin
+            perform * from public.list_organization_members('82000000-0000-0000-0000-0000000000B1');
+            v_allowed := true;
+        exception when others then
+            if sqlerrm not like '%org_not_found%' then
+                raise;
+            end if;
+        end;
+        if v_allowed then
+            raise exception 'FAIL T28: non-admin member listed their own org';
+        end if;
+    end;
 end $$;
 
 set local role anon;
@@ -802,7 +842,7 @@ end $$;
 -- The Add-Member lookup must return profiles who are NOT yet members of the
 -- target org — never the current roster. It searches full_name/badge_number
 -- (case-insensitive substring), caps at 10, exposes only id/full_name/
--- badge_number, and requires the caller to belong to the target org.
+-- badge_number, and requires the caller to be an admin of the target org.
 -- =============================================================================
 set local role authenticated;
 set local request.jwt.claims = '{"sub":"81000000-0000-0000-0000-000000000001"}';

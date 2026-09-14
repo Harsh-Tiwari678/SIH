@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --experimental-test-module-mocks --experimental-loader ./lib/blockchain/test-support/test-loader.mjs --test lib/blockchain/*.test.ts lib/evidence-serialization.test.ts lib/evidence-access.test.ts lib/evidence-access-route/access-route.test.ts lib/audit-serialization.test.ts lib/organization-api/*.test.ts lib/cases-api/*.test.ts"
+    "test": "node --experimental-strip-types --experimental-test-module-mocks --experimental-loader ./lib/blockchain/test-support/test-loader.mjs --test lib/blockchain/*.test.ts lib/evidence-serialization.test.ts lib/evidence-registration.test.ts lib/evidence-access.test.ts lib/evidence-access-route/access-route.test.ts lib/audit-serialization.test.ts lib/organization-api/*.test.ts lib/cases-api/*.test.ts"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.23",
